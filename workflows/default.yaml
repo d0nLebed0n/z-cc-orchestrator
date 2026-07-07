@@ -1,0 +1,26 @@
+name: default
+description: |
+  Базовый воркфлоу: glm имплементит → codex ревьюит.
+  Если нужна правка по замечаниям review — используйте `agentic` (цикл).
+  Кросс-семейность: Z.ai(implement) → OpenAI(review).
+steps:
+  - id: implement
+    agent: glm
+    role: implement
+    effort: medium
+    budget:
+      wall_time_sec: 1500
+      max_steps: 3
+    depends_on: []
+    target_paths: []
+
+  - id: review
+    agent: codex
+    role: review
+    effort: medium
+    budget:
+      wall_time_sec: 900
+      max_steps: 2
+      max_session_min: 25
+    depends_on: [implement]
+    target_paths: []

@@ -1,0 +1,25 @@
+name: ui
+description: |
+  Фронтенд/Nuxt: glm имплементит UI → codex ревьюит.
+  Кросс-семейность: Z.ai(implement) → OpenAI(review). PLAN §3.2.
+steps:
+  - id: implement
+    agent: glm
+    role: implement
+    effort: high
+    budget:
+      wall_time_sec: 1800
+      max_steps: 3
+    depends_on: []
+    target_paths: []
+
+  - id: review
+    agent: codex
+    role: review
+    effort: medium
+    budget:
+      wall_time_sec: 900
+      max_steps: 2
+      max_session_min: 25
+    depends_on: [implement]
+    target_paths: []

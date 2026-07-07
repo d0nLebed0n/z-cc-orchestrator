@@ -1,0 +1,16 @@
+#!/usr/bin/env node
+// Shim: запускает раннер через tsx без билд-шага (PLAN §4).
+// src/cli.ts сам парсит аргументы и зовёт runner.
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
+import { spawn } from "node:child_process";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const cliPath = join(__dirname, "..", "src", "cli.ts");
+
+const child = spawn("npx", ["tsx", cliPath, ...process.argv.slice(2)], {
+  stdio: "inherit",
+  env: process.env,
+});
+
+child.on("exit", (code) => process.exit(code ?? 1));

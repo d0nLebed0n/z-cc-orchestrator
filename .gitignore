@@ -1,0 +1,21 @@
+# dependencies
+node_modules/
+
+# build
+dist/
+
+# runtime blackboard (§4)
+.orchestrator/
+
+# secrets
+.env
+.env.local
+*.secret
+
+# OS / editors
+.DS_Store
+.idea/
+.vscode/
+
+# logs
+*.log

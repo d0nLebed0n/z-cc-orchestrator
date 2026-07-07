@@ -1,0 +1,25 @@
+name: boilerplate
+description: |
+  Массовый boilerplate на GLM, ревьюит Codex.
+  Кросс-семейность: Z.ai(generate) → OpenAI(review). PLAN §3.2.
+steps:
+  - id: generate
+    agent: glm
+    role: implement
+    effort: low
+    budget:
+      wall_time_sec: 1200
+      max_steps: 2
+    depends_on: []
+    target_paths: []
+
+  - id: review
+    agent: codex
+    role: review
+    effort: medium
+    budget:
+      wall_time_sec: 900
+      max_steps: 2
+      max_session_min: 25
+    depends_on: [generate]
+    target_paths: []

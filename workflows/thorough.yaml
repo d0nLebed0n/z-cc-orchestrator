@@ -1,0 +1,53 @@
+name: thorough
+description: |
+  Полный цикл с финальной приёмкой: claude планирует → glm имплементит →
+  codex ревьюит (цикл пока APPROVE, лимит 3) → claude финальная приёмка.
+  Кросс-семейность: Anthropic(plan) → Z.ai(implement) → OpenAI(review).
+  post-loop: Anthropic(final) ревьюит всю работу целиком.
+steps: []  # без pre-loop шагов
+post_steps:
+  # post-loop: финальная приёмка после выхода из цикла
+  - id: final
+    agent: claude
+    role: final
+    effort: medium
+    budget:
+      wall_time_sec: 600
+      max_steps: 1
+    depends_on: []
+    target_paths: []
+loop:
+  steps:
+    - id: plan
+      agent: claude
+      role: plan
+      effort: high
+      budget:
+        wall_time_sec: 900
+        max_steps: 2
+      depends_on: []
+      target_paths: []
+
+    - id: implement
+      agent: glm
+      role: implement
+      effort: high
+      budget:
+        wall_time_sec: 1500
+        max_steps: 3
+      depends_on: [plan]
+      target_paths: []
+
+    - id: review
+      agent: codex
+      role: review
+      effort: high
+      budget:
+        wall_time_sec: 900
+        max_steps: 2
+        max_session_min: 25
+      depends_on: [implement]
+      target_paths: []
+  exit_on: review
+  max_iterations: 3
+  on_exhausted: hitl
