@@ -7,11 +7,13 @@
  */
 import { z } from "zod";
 import { AGENTS, type AgentName, type Family } from "./families.ts";
+import type { Subtask } from "./plan.ts";
 
 export const WorkflowStepSchema = z.object({
   /** Имя шага (уникально в воркфлоу). */
   id: z.string().min(1),
-  agent: z.enum(["claude", "codex", "glm"]),
+  /** Агент шага. Опционален только для fan_out-шагов (исполнитель определяется по подзадаче). */
+  agent: z.enum(["claude", "codex", "glm"]).optional(),
   role: z.enum(["plan", "implement", "review", "refine", "fix", "final"]),
   effort: z.enum(["low", "medium", "high", "xhigh"]).default("medium"),
   budget: z.object({
@@ -26,6 +28,14 @@ export const WorkflowStepSchema = z.object({
   target_paths: z.array(z.string()).default([]),
   /** Явное разрешение review той же семьёй (§3.4). */
   allow_same_family: z.boolean().default(false),
+  /** Если true — шаг раскрывается раннером в N (implement+review) по плану from_plan. */
+  fan_out: z.boolean().default(false),
+  /** id plan-шага, чей вывод парсится как SubtaskPlan. Обязательно при fan_out. */
+  from_plan: z.string().min(1).optional(),
+  /** Допустимые исполнители подзадач. Обязательно при fan_out. */
+  agents: z.array(z.enum(["claude", "codex", "glm", "ollama"])).optional(),
+  /** Добавить codex(review) на каждую подзадачу. */
+  review: z.boolean().default(false),
 });
 export type WorkflowStep = z.infer<typeof WorkflowStepSchema>;
 
@@ -45,6 +55,8 @@ export type Loop = z.infer<typeof LoopSchema>;
 export const WorkflowSchema = z.object({
   name: z.string().min(1),
   description: z.string().default(""),
+  complexity_threshold: z.number().int().min(0).max(100).default(80),
+  max_parallel: z.number().int().positive().default(3),
   /** Линейные шаги ДО цикла (DAG). Могут быть пустым массивом. */
   steps: z.array(WorkflowStepSchema).default([]),
   /** Опциональный цикл. Если есть — исполняется после `steps`. */
@@ -58,21 +70,52 @@ export const WorkflowSchema = z.object({
 ).refine(
   (w) => w.post_steps.length === 0 || w.loop !== undefined,
   { message: "post_steps require a loop (otherwise use steps)" },
-);
+)
+// fan_out consistency
+.refine(
+  (w) => w.steps.every((s) => !s.fan_out || (s.from_plan && s.agents && s.agents.length > 0)),
+  { message: "fan_out steps require from_plan and agents" },
+)
+.refine(
+  (w) => w.steps.every((s) => !s.fan_out || !s.review || !s.agents!.includes("codex")),
+  { message: "fan_out with review cannot list codex in agents (codex is the reviewer)" },
+)
+// from_plan references an earlier step (declared before it)
+.refine((w) => {
+  const ids = w.steps.map((s) => s.id);
+  for (const s of w.steps) {
+    if (s.fan_out && s.from_plan) {
+      const fi = ids.indexOf(s.from_plan);
+      const si = ids.indexOf(s.id);
+      if (fi === -1 || fi >= si) return false;
+    }
+  }
+  return true;
+}, { message: "fan_out.from_plan must reference an earlier step id" });
 export type Workflow = z.infer<typeof WorkflowSchema>;
 
-/** Дополненный шаг: family выводится из агента. */
+/** Дополненный шаг: family выводится из агента. agent всегда определён
+ *  (для fan_out-шагов — плейсхолдер из agents[0], реальный исполнитель ставится по подзадаче). */
 export interface ResolvedStep extends WorkflowStep {
+  agent: "claude" | "codex" | "glm";
   family: Family;
   agentName: AgentName;
 }
 
 export function resolveWorkflow(steps: WorkflowStep[]): ResolvedStep[] {
-  return steps.map((s) => ({
-    ...s,
-    agentName: s.agent as AgentName,
-    family: AGENTS[s.agent as AgentName].family,
-  }));
+  return steps.map((s) => {
+    // fan_out-шаги не имеют агента в схеме — исполнитель определяется по подзадаче.
+    // Даём детерминированный плейсхолдер "claude"; раннер не исполняет fan_out-шаг
+    // напрямую (Task 10 раскрывает его по подзадачам), так что агент шага не используется.
+    const agent: "claude" | "codex" | "glm" = s.agent ?? "claude";
+    const agentName = agent as AgentName;
+    return {
+      ...s,
+      agent,
+      agentName,
+      family: AGENTS[agentName].family,
+    };
+  });
 }
 
 /**
@@ -138,14 +181,19 @@ export function assertCrossFamilyReview(steps: ResolvedStep[]): void {
 
 function findAuthor(review: ResolvedStep, all: ResolvedStep[]): ResolvedStep | null {
   const implementRoles = new Set(["implement", "refine", "fix"]);
+  // fan_out-шаги не считаются автором для статической cross-family проверки:
+  // они раскрываются в подзадачи со смесью семей, кросс-семейность проверяется
+  // динамически по подзадаче (Task 10).
+  const isRealAuthor = (s: ResolvedStep | undefined): s is ResolvedStep =>
+    !!s && !s.fan_out && implementRoles.has(s.role);
   for (const dep of review.depends_on) {
     const s = all.find((x) => x.id === dep);
-    if (s && implementRoles.has(s.role)) return s;
+    if (isRealAuthor(s)) return s;
   }
   const reviewIdx = all.findIndex((x) => x.id === review.id);
   for (let i = reviewIdx - 1; i >= 0; i--) {
     const s = all[i];
-    if (s && implementRoles.has(s.role)) return s;
+    if (isRealAuthor(s)) return s;
   }
   return null;
 }
@@ -176,10 +224,45 @@ export function orderLoopBody(steps: ResolvedStep[]): ResolvedStep[] {
   return ordered;
 }
 
+/** Нормализовать путь: убрать ./ и повторные слэши, без leading ./ */
+function norm(p: string): string {
+  return p.replace(/\\/g, "/").replace(/\/+/g, "/").replace(/^\.\//, "").replace(/\/\.\//g, "/");
+}
+
+/** Пересекаются ли две области target_paths? parent/child считается пересечением. */
+export function pathsOverlap(a: string[], b: string[]): boolean {
+  const na = a.map(norm);
+  const nb = b.map(norm);
+  for (const x of na) for (const y of nb) {
+    if (x === y) return true;
+    if (x.startsWith(y + "/") || y.startsWith(x + "/")) return true; // parent/child
+  }
+  return false;
+}
+
+/** Маршрутизация подзадачи: complexity >= threshold → strong, иначе local. Берёт первого подходящего из agents. */
+export function routeSubtask(subtask: Subtask, agents: AgentName[], threshold: number): AgentName {
+  const strong = subtask.complexity >= threshold;
+  for (const a of agents) {
+    const fam = AGENTS[a].family;
+    if (strong && fam !== "local") return a;
+    if (!strong && fam === "local") return a;
+  }
+  throw new Error(`routeSubtask: no agent for subtask ${subtask.id} (complexity ${subtask.complexity}, threshold ${threshold}, side=${strong ? "strong" : "local"}) in agents [${agents.join(",")}]`);
+}
+
+/** Раскрытие fan_out-шага: откуда брать план, кто исполняет, нужен ли codex-ревью. */
+export interface FanOutSpec {
+  step: ResolvedStep;
+  fromPlanId: string;
+  agents: AgentName[];
+  review: boolean;
+}
+
 /** Результат loadWorkflow — всё, что нужно раннеру для исполнения. */
 export interface LoadedWorkflow {
   wf: Workflow;
-  /** Линейные шаги ДО цикла (DAG → уровни). */
+  /** Линейные шаги ДО цикла (DAG → уровни). fan_out-шаги сюда не входят. */
   preLevels: ResolvedStep[][];
   /** Тело цикла (последовательный порядок). Пусто, если loop нет. */
   loopBody: ResolvedStep[];
@@ -189,18 +272,34 @@ export interface LoadedWorkflow {
   postLevels: ResolvedStep[][];
   /** Все шаги (pre + loop + post) — для contextFromPrevStep и stepIdx. */
   allSteps: ResolvedStep[];
+  /** Раскрытия fan_out-шагов (раннер раскрывает по плану из fromPlanId, Task 10). */
+  fanOuts: FanOutSpec[];
 }
 
 /**
  * Загрузить и провалидировать воркфлоу из YAML: парсинг, resolve, валидации.
- * Возвращает структуру для раннера.
+ * Возвращает структуру для раннера. fan_out-шаги исключаются из preLevels
+ * и регистрируются отдельно в fanOuts.
  */
 export function buildLoadedWorkflow(wf: Workflow): LoadedWorkflow {
-  const preSteps = resolveWorkflow(wf.steps);
-  // Валидации для линейной части (pre).
-  assertCrossFamilyReview(preSteps);
-  const preLevels = topoLevels(preSteps);
+  const allPre = resolveWorkflow(wf.steps);
+  assertCrossFamilyReview(allPre);
+
+  // Разделить: обычные шаги идут в preLevels, fan_out-шаги — в fanOuts.
+  const plainSteps = allPre.filter((s) => !s.fan_out);
+  const fanOutSteps = allPre.filter((s) => s.fan_out);
+  const preLevels = topoLevels(plainSteps);
   for (const level of preLevels) assertNonOverlappingPaths(level);
+
+  const fanOuts: FanOutSpec[] = fanOutSteps.map((s) => ({
+    step: s,
+    fromPlanId: s.from_plan!,
+    agents: s.agents!,
+    review: s.review,
+  }));
+  if (fanOuts.length > 1) {
+    throw new Error("Only one fan_out step per workflow is supported (YAGNI)");
+  }
 
   let loopBody: ResolvedStep[] = [];
   let loop: Loop | undefined;
@@ -230,6 +329,6 @@ export function buildLoadedWorkflow(wf: Workflow): LoadedWorkflow {
   for (const level of postLevels) assertNonOverlappingPaths(level);
 
   // allSteps = pre + loop + post (для stepIdx/context). stepIdx сквозной.
-  const allSteps = [...preSteps, ...loopBody, ...postSteps];
-  return { wf, preLevels, loopBody, loop, postLevels, allSteps };
+  const allSteps = [...allPre, ...loopBody, ...postSteps];
+  return { wf, preLevels, loopBody, loop, postLevels, allSteps, fanOuts };
 }
