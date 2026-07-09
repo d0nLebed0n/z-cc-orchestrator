@@ -177,6 +177,10 @@ async function main(): Promise<void> {
   // max-parallel: CLI флаг > воркфлоу max_parallel > 3 (раннер разрешает финал).
   const maxParallelRaw = typeof values["max-parallel"] === "string" ? values["max-parallel"] : undefined;
   const maxParallel = maxParallelRaw ? Number.parseInt(maxParallelRaw, 10) : undefined;
+  if (maxParallelRaw !== undefined && (!maxParallel || !Number.isFinite(maxParallel) || maxParallel < 1)) {
+    console.error(`Invalid --max-parallel value: '${maxParallelRaw}' (must be a positive integer)`);
+    process.exit(1);
+  }
 
   console.log(`▶ workflow: ${workflowName}`);
   console.log(`▶ project:  ${project}`);

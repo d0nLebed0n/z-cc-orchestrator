@@ -26,4 +26,11 @@ for (const bad of ["no json here", "", "{}", "{\"subtasks\":[]}", "{\"subtasks\"
 try { parsePlan('{"subtasks":[{"id":"P1","title":"t","goal":"g","complexity":150,"target_paths":["a.ts"],"acceptance_criteria":"ok"}]}'); console.error("✗ complexity 150 should throw"); process.exit(1); }
 catch { console.log("✓ complexity >100 rejected"); }
 
+// duplicate subtask ids → reject (candidate branch collision guard)
+try {
+  parsePlan('{"subtasks":[{"id":"P1","title":"t","goal":"g","complexity":10,"target_paths":["a.ts"],"acceptance_criteria":"ok"},{"id":"P1","title":"t2","goal":"g2","complexity":20,"target_paths":["b.ts"],"acceptance_criteria":"ok2"}]}');
+  console.error("✗ duplicate subtask ids should throw"); process.exit(1);
+}
+catch { console.log("✓ duplicate subtask ids rejected"); }
+
 console.log("\nAll plan checks passed.");

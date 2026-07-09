@@ -16,7 +16,10 @@ export type Subtask = z.infer<typeof SubtaskSchema>;
 
 export const SubtaskPlanSchema = z.object({
   subtasks: z.array(SubtaskSchema).min(1),
-});
+}).refine(
+  (p) => new Set(p.subtasks.map((s) => s.id)).size === p.subtasks.length,
+  { message: "subtask ids must be unique (duplicate id would collide candidate branches)" },
+);
 export type SubtaskPlan = z.infer<typeof SubtaskPlanSchema>;
 
 /**
