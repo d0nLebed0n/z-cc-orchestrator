@@ -11,9 +11,14 @@ import { parse as parseYaml } from "yaml";
 import {
   WorkflowSchema,
   buildLoadedWorkflow,
+  routeSubtask,
+  pathsOverlap,
   type ResolvedStep,
   type LoadedWorkflow,
+  type FanOutSpec,
 } from "./workflow.ts";
+import { AGENTS, type AgentName } from "./families.ts";
+import { parsePlan, type Subtask, type SubtaskPlan } from "./plan.ts";
 import { makeEnvelope, type TaskEnvelope } from "./envelope.ts";
 import { getWorker, type WorkerResult, type WorkerRunOptions } from "./workers/index.ts";
 import {
@@ -42,13 +47,15 @@ import {
   removeWorktree,
   commitAllInWorktree,
   removeIntegrationWorktree,
+  createCandidateWorktree,
+  promoteCandidateToIntegration,
+  discardCandidate,
   git,
   integrationBranch,
   type WorktreeHandle,
 } from "./worktree.ts";
 import { buildWorkerPrompt } from "./prompts/roles.ts";
 import { checkHealthForAgents, formatHealthReport } from "./workers/health.ts";
-import type { AgentName } from "./families.ts";
 
 /** Ограниченный пул конкурентности: не больше maxParallel одновременно. Сохраняет порядок результатов. */
 export async function runBounded<T, U>(
@@ -76,6 +83,11 @@ export interface RunOptions {
   project: string;
   /** env для GLM (base url + key), если в воркфлоу есть glm-шаги. */
   glmEnv?: Record<string, string>;
+  /** env для ollama (OLLAMA_BASE_URL / OLLAMA_MODEL), если в fan_out есть ollama.
+   *  runOllama читает process.env напрямую, но раннер должен загрузить эти
+   *  переменные (напр. из .env.local) ДО запуска, чтобы health-gate и worker
+   *  их видели. Task 11 загружает .env.local и выставляет process.env. */
+  ollamaEnv?: Record<string, string>;
   /** Лимит параллельных воркеров (PLAN §5: потолок 3). */
   maxParallel?: number;
 }
@@ -210,7 +222,14 @@ async function runWorkerOnly(
   let cwd = o.cwdOverride ?? projectPath;
   if (!o.skipWorktree && !o.cwdOverride) {
     if (["implement", "refine", "fix"].includes(step.role)) {
-      const branchAgent = o.subtaskSuffix ? `${step.agent}${o.subtaskSuffix}` : step.agent;
+      // branchAgent: для fan-out — "<agent>~<subtaskId>" (напр. "ollama~P1"). НО '~'
+      // недопустим в git ref-именах (git check-ref-format его режектит). Поэтому в
+      // ИМЕНИ ВЕТКИ заменяем '~' на '.' (git-ref-safe), stepId при этом сохраняет '~'
+      // (это просто имя файла/JSON-ключа, не ref). Так branch = orch/<task>/ollama.P1,
+      // а stepId = <task>-S02~P1 — оба валидны в своих доменах.
+      const branchAgent = o.subtaskSuffix
+        ? `${step.agent}${o.subtaskSuffix.replace(/~/g, ".")}`
+        : step.agent;
       wt = await createWorktree(projectPath, taskId, branchAgent);
       cwd = wt.path;
     }
@@ -456,15 +475,295 @@ async function runStep(
   return { result, stepId, output };
 }
 
+// ─── Fan-out (Task 10): two-phase merge ─────────────────────────────────────
+//
+// Phase A — implement параллельно через runBounded (каждая подзадача в своём
+//           worktree, БЕЗ merge в integration). Коммитим правки в implement-ветку,
+//           но оставляем merge на Phase B.
+// Phase B — СТРОГО последовательно: для каждой подзадачи создаём disposable
+//           candidate-ветку от текущей integration, мержим туда implement-ветку,
+//           проверяем diff-guard (правки только в target_paths), гоняем codex-review
+//           в candidate-worktree, и ТОЛЬКО при APPROVE продвигаем candidate в
+//           integration (ff). При REJECT/REQUEST_CHANGES/out-of-scope — discard.
+//
+// Последовательность Phase B критична: параллельные candidate-мержи дали бы гонку
+// за HEAD integration (две ветки пытаются ff одну и ту же integration одновременно).
+//
+// Агрегат пишется под БАЗОВЫМ stepId fan_out-шага (без суффикса подзадачи), чтобы
+// downstream-шаги (final с depends_on:[build]) нашли его через contextFromPrevStep.
+
+/** Итог фан-аута: все ли подзадачи одобрены + список провалившихся. */
+interface FanOutOutcome {
+  allApproved: boolean;
+  failedSubtasks: string[];
+}
+
+/**
+ * Запустить fan_out-шаг: маршрутизация подзадач → Phase A (implement) →
+ * Phase B (candidate merge + review + promote) → агрегат под базовым stepId.
+ *
+ * @param integrationWtPath путь к worktree integration-ветки (от setupIntegration)
+ * @param glmEnv env для GLM-исполнителей (base url + key)
+ * @param ollamaEnv env для ollama-исполнителей (runOllama читает process.env, но
+ *   раннер должен их уже выставить — см. Task 11)
+ * @param threshold complexity_threshold из воркфлоу (маршрутизация strong vs local)
+ * @param maxParallel потолок параллельности Phase A (effectiveMaxParallel)
+ */
+async function runFanOut(
+  taskId: string,
+  spec: FanOutSpec,
+  allSteps: ResolvedStep[],
+  prompt: string,
+  projectPath: string,
+  integrationWtPath: string,
+  glmEnv: Record<string, string> | undefined,
+  ollamaEnv: Record<string, string> | undefined,
+  breaker: CircuitBreaker,
+  threshold: number,
+  maxParallel: number,
+): Promise<FanOutOutcome> {
+  const stepIdx = allSteps.indexOf(spec.step);
+  const planStepIdx = allSteps.findIndex((s) => s.id === spec.fromPlanId);
+  // plan-шаг уже исполнен на линейном пути (preLevels); читаем его результат.
+  const planStepId = newStepId(taskId, planStepIdx + 1, 1);
+  const planResult = await readResult(taskId, planStepId);
+  if (!planResult || typeof planResult !== "object" || !("output" in planResult)) {
+    await escalateHitl({ task_id: taskId, step_id: planStepId, reason: "fan_out: plan result missing", detail: {} });
+    return { allApproved: false, failedSubtasks: ["(no plan)"] };
+  }
+  const planOutput = String((planResult as { output: string }).output);
+  let plan: SubtaskPlan;
+  try {
+    plan = parsePlan(planOutput);
+  } catch (e) {
+    await escalateHitl({
+      task_id: taskId, step_id: planStepId, reason: "fan_out: parsePlan failed",
+      detail: { error: e instanceof Error ? e.message : String(e) },
+    });
+    return { allApproved: false, failedSubtasks: ["(bad plan)"] };
+  }
+
+  // ── Маршрутизация + проверка пересечения target_paths (point #11, strict v1). ──
+  type Routed = { subtask: Subtask; agent: AgentName };
+  const routed: Routed[] = [];
+  const failed: string[] = [];
+  for (const subtask of plan.subtasks) {
+    try {
+      const agent = routeSubtask(subtask, spec.agents, threshold);
+      routed.push({ subtask, agent });
+    } catch (e) {
+      failed.push(subtask.id);
+      await escalateHitl({
+        task_id: taskId, step_id: null,
+        reason: `fan_out: subtask ${subtask.id} unroutable`,
+        detail: { error: e instanceof Error ? e.message : String(e) },
+      });
+    }
+  }
+  // target_paths пересечение (строгий v1 — HITL, не пытаемся упорядочить).
+  for (let i = 0; i < routed.length; i++) {
+    for (let j = i + 1; j < routed.length; j++) {
+      if (pathsOverlap(routed[i]!.subtask.target_paths, routed[j]!.subtask.target_paths)) {
+        await escalateHitl({
+          task_id: taskId, step_id: null,
+          reason: `fan_out: target_paths overlap between ${routed[i]!.subtask.id} and ${routed[j]!.subtask.id}`,
+          detail: { a: routed[i]!.subtask.target_paths, b: routed[j]!.subtask.target_paths },
+        });
+        return { allApproved: false, failedSubtasks: ["(path overlap)"] };
+      }
+    }
+  }
+
+  // ── Phase A: implement параллельно (БЕЗ merge в integration). ──
+  // runBounded ограничивает конкурентность до maxParallel — НИКОГДА не пускаем
+  // все implement-ы разом (point #3).
+  type PhaseAResult = { subtask: Subtask; agent: AgentName; result: WorkerResult; stepId: string; wt: WorktreeHandle | null };
+  const phaseA: (PhaseAResult | null)[] = await runBounded(routed, maxParallel, async ({ subtask, agent }) => {
+    if (breaker.isTripped(agent)) {
+      await escalateHitl({
+        task_id: taskId, step_id: null,
+        reason: `circuit breaker tripped on '${agent}' for subtask ${subtask.id}`,
+        detail: {},
+      });
+      failed.push(subtask.id);
+      return null;
+    }
+    // impl-шаг: клонируем spec.step, подставляя реального исполнителя подзадачи.
+    // agent может быть "ollama" — поэтому ResolvedStep.agent имеет тип AgentName.
+    const implStep: ResolvedStep = {
+      ...spec.step,
+      agent,
+      agentName: agent,
+      family: AGENTS[agent].family,
+      target_paths: subtask.target_paths,
+    };
+    // env для воркера: glm → glmEnv (runWorkerOnly передаёт как opts.env при agent==="glm");
+    // ollama → process.env (runOllama читает напрямую; ollamaEnv должен быть уже в process.env).
+    const envFor = agent === "glm" ? glmEnv : agent === "ollama" ? ollamaEnv : undefined;
+    const { result, stepId, wt } = await runWorkerOnly(
+      taskId, implStep, stepIdx,
+      `${subtask.goal}\n\nACCEPTANCE CRITERIA: ${subtask.acceptance_criteria}`,
+      projectPath, envFor, breaker, allSteps,
+      { subtaskSuffix: `~${subtask.id}` },
+    );
+    // Коммитим правки в implement-ветку (чтобы они ушли в merge на Phase B), но НЕ мержим.
+    if (wt && result.success) {
+      await commitAllInWorktree(wt, `orch(${agent}/implement): ${stepId}`);
+    }
+    if (!result.success) failed.push(subtask.id);
+    return { subtask, agent, result, stepId, wt };
+  });
+
+  // ── Phase B: candidate merge + review — СТРОГО последовательно (point #2). ──
+  // Гонка за HEAD integration при параллельных ff-продвижениях — поэтому один за другим.
+  let allApproved = true;
+  const summaries: string[] = [];
+  for (const item of phaseA) {
+    if (!item || !item.result.success || !item.wt) {
+      // implement провалился (или breaker, или нет worktree) — пропускаем, cleanup.
+      if (item) summaries.push(`- ${item.subtask.id}: FAILED (implement)`);
+      allApproved = false;
+      if (item?.wt) await removeWorktree(projectPath, item.wt);
+      continue;
+    }
+    if (!spec.review) {
+      // Без review — мержим implement-ветку в integration сразу (как линейный путь).
+      const mr = await mergeWorktree(integrationWtPath, item.wt);
+      if (!mr.ok) {
+        failed.push(item.subtask.id);
+        allApproved = false;
+        summaries.push(`- ${item.subtask.id}: FAILED (merge conflict, no review)`);
+      } else {
+        summaries.push(`- ${item.subtask.id}: MERGED (no review)`);
+      }
+      await removeWorktree(projectPath, item.wt);
+      continue;
+    }
+    // С review: candidate от текущей integration + merge implement-ветки в candidate.
+    const candidate = await createCandidateWorktree(projectPath, taskId, item.subtask.id);
+    // mergeWorktree мержит ветку item.wt.branch в каталог candidate.worktreePath
+    // (HEAD там = candidate-ветка). mergeWorktree берёт task_id из handle.
+    const cm = await mergeWorktree(candidate.worktreePath, item.wt);
+    if (!cm.ok) {
+      await discardCandidate(projectPath, candidate);
+      await removeWorktree(projectPath, item.wt);
+      failed.push(item.subtask.id);
+      allApproved = false;
+      summaries.push(`- ${item.subtask.id}: FAILED (candidate merge conflict)`);
+      continue;
+    }
+    // diff guard (point #12): правки только в target_paths подзадачи.
+    // Сравниваем candidate с integration (откуда он создан) — это diff implement-ветки.
+    const { stdout: names } = await git(candidate.worktreePath, ["diff", "--name-only", integrationBranch(taskId), candidate.branch])
+      .catch(() => ({ stdout: "" }));
+    const changed = names.trim().split("\n").filter(Boolean);
+    const outOfScope = changed.filter((f) => {
+      const tp = item.subtask.target_paths;
+      if (tp.length === 0) return false; // нет target_paths → не ограничиваем
+      return !tp.some((p) => f === p || f.startsWith(p + "/") || p.startsWith(f + "/"));
+    });
+    if (outOfScope.length > 0) {
+      await escalateHitl({
+        task_id: taskId, step_id: null,
+        reason: `fan_out: subtask ${item.subtask.id} diff out of target_paths`,
+        detail: { outOfScope, target_paths: item.subtask.target_paths },
+      });
+      await discardCandidate(projectPath, candidate);
+      await removeWorktree(projectPath, item.wt);
+      failed.push(item.subtask.id);
+      allApproved = false;
+      summaries.push(`- ${item.subtask.id}: FAILED (diff out of scope)`);
+      continue;
+    }
+    // codex-review в candidate-worktree (видит смерженный код). skipWorktree + cwdOverride,
+    // чтобы runWorkerOnly не создавал собственный worktree — ревьюер работает в candidate.
+    const reviewStep: ResolvedStep = {
+      ...spec.step,
+      agent: "codex",
+      agentName: "codex",
+      family: AGENTS.codex.family,
+      role: "review",
+    };
+    const rr = await runWorkerOnly(
+      taskId, reviewStep, stepIdx, buildReviewPrompt(item.subtask),
+      projectPath, undefined, breaker, allSteps,
+      { subtaskSuffix: `~${item.subtask.id}r`, cwdOverride: candidate.worktreePath, skipWorktree: true },
+    );
+    const verdict = await parseVerdict(taskId, rr.stepId);
+    if (verdict === "APPROVE" || verdict === "ACCEPT") {
+      // APPROVE → продвигаем candidate в integration (ff), cleanup candidate.
+      const prom = await promoteCandidateToIntegration(projectPath, taskId, candidate);
+      if (prom.ok) {
+        summaries.push(`- ${item.subtask.id}: APPROVE (codex)`);
+      } else {
+        // promote провалился — candidate уже мог быть частично зачищен; считаем провалом.
+        failed.push(item.subtask.id);
+        allApproved = false;
+        summaries.push(`- ${item.subtask.id}: APPROVE but promote FAILED (${prom.message})`);
+      }
+    } else {
+      // REJECT / REQUEST_CHANGES / null → discard candidate (без продвижения).
+      await discardCandidate(projectPath, candidate);
+      failed.push(item.subtask.id);
+      allApproved = false;
+      summaries.push(`- ${item.subtask.id}: ${verdict ?? "no verdict"} → rejected`);
+    }
+    // implement-ветка больше не нужна в любом случае (смержена в candidate или candidate выброшен).
+    await removeWorktree(projectPath, item.wt);
+  }
+
+  // ── Агрегат под базовым stepId (без суффикса подзадачи) — point #2. ──
+  // Downstream final с depends_on:[build] найдёт этот результат через contextFromPrevStep.
+  const baseStepId = newStepId(taskId, stepIdx + 1, 1);
+  await writeResult(taskId, baseStepId, {
+    envelope_id: baseStepId,
+    agent: "fan_out",
+    role: spec.step.role,
+    output: summaries.length > 0 ? summaries.join("\n") : "(no subtasks)",
+    signals: [],
+    success: allApproved,
+    reason: allApproved ? null : "partial_failure",
+    duration_ms: 0,
+    timed_out: false,
+  });
+
+  return { allApproved, failedSubtasks: failed };
+}
+
+/** Сборка промпта для codex-review подзадачи в candidate-worktree. */
+function buildReviewPrompt(subtask: Subtask): string {
+  return [
+    "Review the implementation of this subtask in the current worktree.",
+    "The worktree is a candidate branch containing the implementer's changes merged on top of integration.",
+    "",
+    `SUBTASK GOAL: ${subtask.goal}`,
+    `ACCEPTANCE CRITERIA: ${subtask.acceptance_criteria}`,
+    `TARGET PATHS: ${subtask.target_paths.join(", ") || "(none)"}`,
+    "",
+    "Use your normal review tools to read the diff and the files.",
+    "Return your standard review format ending with VERDICT: APPROVE | REQUEST_CHANGES | REJECT.",
+  ].join("\n");
+}
+
 /** Точка входа раннера: запустить воркфлоу над проектом. */
 export async function runWorkflow(opts: RunOptions): Promise<RunResult> {
   const loaded = await loadWorkflow(opts.workflowPath);
-  const { preLevels, loopBody, loop, postLevels, allSteps } = loaded;
+  const { preLevels, postFanOutLevels, loopBody, loop, postLevels, allSteps, fanOuts } = loaded;
   const projectPath = opts.project;
-  const maxParallel = opts.maxParallel ?? 3;
+  // effectiveMaxParallel (point #7): opts.maxParallel ?? wf.max_parallel ?? 3.
+  const effectiveMaxParallel = opts.maxParallel ?? loaded.wf.max_parallel ?? 3;
+  const threshold = loaded.wf.complexity_threshold;
+  // ollama env: runOllama читает process.env напрямую, но раннер должен знать
+  // о нём для health-gate и логирования (Task 11 выставляет process.env из .env.local).
+  const ollamaEnv = opts.ollamaEnv;
 
   // ─── Health gate: проверить все агенты воркфлоу ДО создания задачи ───
-  const uniqueAgents = Array.from(new Set(allSteps.map((s) => s.agentName)));
+  // point #8: uniqueAgents ДОЛЖНЫ включать fanOuts[].agents — иначе ollama
+  // (если он есть только в fan_out) не пройдёт health-check и упадёт на запуске.
+  const uniqueAgents = Array.from(new Set([
+    ...allSteps.filter((s) => !s.fan_out).map((s) => s.agentName),
+    ...fanOuts.flatMap((f) => f.agents),
+  ]));
   const healthResults = await checkHealthForAgents(uniqueAgents, opts.glmEnv);
   const unhealthy: AgentName[] = [];
   for (const [agent, r] of healthResults) {
@@ -492,7 +791,7 @@ export async function runWorkflow(opts: RunOptions): Promise<RunResult> {
   // ─── Линейная часть (pre-loop): DAG по уровням ───
   for (const level of preLevels) {
     const parallelizable = level.length > 1;
-    const concurrency = parallelizable ? Math.min(level.length, maxParallel) : 1;
+    const concurrency = parallelizable ? Math.min(level.length, effectiveMaxParallel) : 1;
     if (concurrency > 1) {
       const results = await Promise.all(
         level.map((step) =>
@@ -510,6 +809,38 @@ export async function runWorkflow(opts: RunOptions): Promise<RunResult> {
       }
     }
     if (!overallSuccess) break; // провал на уровне — не идём дальше
+  }
+
+  // ─── Fan-out (если есть) — после preLevels, до postFanOutLevels/цикла ───
+  // point #1: Phase A (parallel implement) + Phase B (sequential candidate merge).
+  // plan-шаг (fromPlanId) уже исполнен в preLevels; читаем его результат внутри runFanOut.
+  if (overallSuccess && fanOuts.length > 0) {
+    for (const spec of fanOuts) {
+      const fo = await runFanOut(
+        task.id, spec, allSteps, opts.prompt, projectPath,
+        integration.worktreePath, opts.glmEnv, ollamaEnv, breaker,
+        threshold, effectiveMaxParallel,
+      );
+      if (!fo.allApproved) overallSuccess = false;
+    }
+  }
+
+  // ─── Шаги, зависящие от fan_out (напр. final с depends_on:[build]) ───
+  // Исполняются ПОСЛЕ fan-out — найдут агрегат fan-out через contextFromPrevStep.
+  if (overallSuccess) {
+    for (const level of postFanOutLevels) {
+      for (const step of level) {
+        const r = await runStep(
+          task.id, step, allSteps.indexOf(step), opts.prompt,
+          projectPath, integration.worktreePath, opts.glmEnv, breaker, allSteps,
+        );
+        if (!r.result.success) {
+          overallSuccess = false;
+          break;
+        }
+      }
+      if (!overallSuccess) break;
+    }
   }
 
   // ─── Цикл (если есть) ───
@@ -610,7 +941,11 @@ export async function runWorkflow(opts: RunOptions): Promise<RunResult> {
 
   // При провале — cleanup integration worktree (ветку оставляем для разбора).
   // При успехе — worktree живёт до acceptTask (ветка нужна для merge в main).
-  if (!overallSuccess) {
+  // point #9 (исключение): при ЧАСТИЧНОМ провале fan-out НЕ удаляем integration-worktree —
+  // там уже живут смерженные хорошие подзадачи (нужны для разбора/восстановления).
+  // Оставляем также ветку (integrationBranch) — она не удаляется здесь в любом случае.
+  const fanOutRan = fanOuts.length > 0;
+  if (!overallSuccess && !fanOutRan) {
     await removeIntegrationWorktree(projectPath, integration.worktreePath);
   }
 

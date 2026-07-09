@@ -119,7 +119,9 @@ export async function checkpointFromResult(
 
 export interface HitlRequest {
   task_id: string;
-  step_id: string;
+  /** id шага, к которому относится эскалация, или null (напр. fan-out эскалация
+   *  на этапе маршрутизации/diff-guard, до того как stepId подзадачи известен). */
+  step_id: string | null;
   reason: string;
   detail: unknown;
 }

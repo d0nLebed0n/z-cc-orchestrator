@@ -268,3 +268,82 @@ export async function cleanupTask(
     // ignore
   }
 }
+
+// ─── Fan-out candidate lifecycle (Task 10, Phase B) ─────────────────────────
+//
+// Phase B мержит implement-ветки ПОСЛЕДОВАТЕЛЬНО (чтобы не было гонки за HEAD
+// integration). Для каждой подзадачи создаётся disposable candidate-ветка от
+// текущей integration, туда мержится implement-ветка, там идёт codex-review,
+// и ТОЛЬКО при APPROVE candidate продвигается в integration (ff). При REJECT /
+// REQUEST_CHANGES / out-of-scope candidate выбрасывается.
+
+/**
+ * Создать disposable candidate-ветку + worktree от текущей integration.
+ * Для фазы B fan-out: туда мержится одна implement-ветка, там идёт review,
+ * и только при APPROVE candidate продвигается в integration.
+ *
+ * ВАЖНО: ни одна операция здесь не делает `git checkout` в основном репо —
+ * ветка создаётся через `git branch`, worktree — через `git worktree add`.
+ */
+export async function createCandidateWorktree(
+  projectPath: string,
+  taskId: string,
+  subtaskId: string,
+): Promise<{ branch: string; worktreePath: string }> {
+  const integration = integrationBranch(taskId);
+  const branch = `orch/${taskId}/cand-${subtaskId}`;
+  const wtPath = await mkdtemp(join(tmpdir(), `orch-${taskId}-cand-${subtaskId}-`));
+  // Ветка от текущей integration (для ff-продвижения без конфликтов).
+  try {
+    await git(projectPath, ["branch", branch, integration]);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (!/already exists|exists/.test(msg)) throw e;
+  }
+  // НЕ --detach: worktree отслеживает candidate-ветку, чтобы коммиты ревьюера
+  // (если ревьюер правит код) и merge-коммит ушли в candidate, а не в detached HEAD.
+  await git(projectPath, ["worktree", "add", wtPath, branch]);
+  return { branch, worktreePath: wtPath };
+}
+
+/**
+ * Продвинуть candidate в integration: ff integration → candidate, затем cleanup
+ * candidate worktree + ветки. Вызывается ТОЛЬКО при APPROVE из Phase B.
+ *
+ * Детерминизм: `git branch -f integration candidate` перемещает integration
+ * на tip candidate (это безопасный ff, т.к. candidate был создан от integration
+ * и толькоAdds commits сверху). Integration НЕ checked out в основном репо (она
+ * живёт в своём worktree), поэтому `-f` разрешён.
+ */
+export async function promoteCandidateToIntegration(
+  projectPath: string,
+  taskId: string,
+  candidate: { branch: string; worktreePath: string },
+): Promise<{ ok: boolean; message: string }> {
+  const integration = integrationBranch(taskId);
+  try {
+    // Переместить integration на tip candidate. integration не checked out в
+    // основном репо (она в собственном worktree) — branch -f разрешён.
+    await git(projectPath, ["branch", "-f", integration, candidate.branch]);
+    // Cleanup candidate worktree + ветка.
+    await git(projectPath, ["worktree", "remove", "--force", candidate.worktreePath]).catch(() => {});
+    await rm(candidate.worktreePath, { recursive: true, force: true }).catch(() => {});
+    await git(projectPath, ["branch", "-D", candidate.branch]).catch(() => {});
+    return { ok: true, message: `integration fast-forwarded to ${candidate.branch.slice(-12)}` };
+  } catch (e) {
+    return { ok: false, message: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+/**
+ * Удалить disposable candidate (без продвижения) — при REJECT / REQUEST_CHANGES
+ * / out-of-scope diff. Cleanup worktree + ветки.
+ */
+export async function discardCandidate(
+  projectPath: string,
+  candidate: { branch: string; worktreePath: string },
+): Promise<void> {
+  await git(projectPath, ["worktree", "remove", "--force", candidate.worktreePath]).catch(() => {});
+  await rm(candidate.worktreePath, { recursive: true, force: true }).catch(() => {});
+  await git(projectPath, ["branch", "-D", candidate.branch]).catch(() => {});
+}

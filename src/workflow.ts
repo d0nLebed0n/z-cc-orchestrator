@@ -95,9 +95,14 @@ export const WorkflowSchema = z.object({
 export type Workflow = z.infer<typeof WorkflowSchema>;
 
 /** Дополненный шаг: family выводится из агента. agent всегда определён
- *  (для fan_out-шагов — плейсхолдер из agents[0], реальный исполнитель ставится по подзадаче). */
-export interface ResolvedStep extends WorkflowStep {
-  agent: "claude" | "codex" | "glm";
+ *  (для fan_out-шагов — плейсхолдер из agents[0], реальный исполнитель ставится по подзадаче).
+ *
+ *  ВАЖНО: agent имеет тип AgentName (включая "ollama"), т.к. при fan-out маршрутизация
+ *  подзадачи может выбрать ollama — и тогда раннер строит impl-шаг с agent="ollama".
+ *  Для обычных (не fan_out) шагов agent всегда один из claude/codex/glm (схема YAML
+ *  не допускает ollama как шагового агента — ollama приходит только через fan_out.agents). */
+export interface ResolvedStep extends Omit<WorkflowStep, "agent"> {
+  agent: AgentName;
   family: Family;
   agentName: AgentName;
 }
@@ -107,13 +112,12 @@ export function resolveWorkflow(steps: WorkflowStep[]): ResolvedStep[] {
     // fan_out-шаги не имеют агента в схеме — исполнитель определяется по подзадаче.
     // Даём детерминированный плейсхолдер "claude"; раннер не исполняет fan_out-шаг
     // напрямую (Task 10 раскрывает его по подзадачам), так что агент шага не используется.
-    const agent: "claude" | "codex" | "glm" = s.agent ?? "claude";
-    const agentName = agent as AgentName;
+    const agent: AgentName = (s.agent ?? "claude") as AgentName;
     return {
       ...s,
       agent,
-      agentName,
-      family: AGENTS[agentName].family,
+      agentName: agent,
+      family: AGENTS[agent].family,
     };
   });
 }
@@ -262,18 +266,57 @@ export interface FanOutSpec {
 /** Результат loadWorkflow — всё, что нужно раннеру для исполнения. */
 export interface LoadedWorkflow {
   wf: Workflow;
-  /** Линейные шаги ДО цикла (DAG → уровни). fan_out-шаги сюда не входят. */
+  /** Линейные шаги ДО цикла и ДО fan-out (DAG → уровни). fan_out-шаги сюда не входят,
+   *  как и шаги, транзитивно зависящие от fan_out-шага (они — в postFanOutLevels). */
   preLevels: ResolvedStep[][];
+  /** Шаги, транзитивно зависящие от fan_out-шага (напр. final с depends_on:[build]).
+   *  Исполняются ПОСЛЕ fan-out. Пусто, если fan_out нет или за ним ничего не стоит. */
+  postFanOutLevels: ResolvedStep[][];
   /** Тело цикла (последовательный порядок). Пусто, если loop нет. */
   loopBody: ResolvedStep[];
   /** Конфиг цикла, если есть. */
   loop: Loop | undefined;
   /** Линейные шаги ПОСЛЕ цикла (DAG → уровни). Пусто, если loop нет. */
   postLevels: ResolvedStep[][];
-  /** Все шаги (pre + loop + post) — для contextFromPrevStep и stepIdx. */
+  /** Все шаги (pre + postFanOut + loop + post) — для contextFromPrevStep и stepIdx. */
   allSteps: ResolvedStep[];
   /** Раскрытия fan_out-шагов (раннер раскрывает по плану из fromPlanId, Task 10). */
   fanOuts: FanOutSpec[];
+}
+
+/**
+ * Найти все id шагов, которые транзитивно зависят от любого из `roots` (по depends_on).
+ * Используется для разбиения plain-шагов вокруг fan_out: шаги, зависящие от fan_out-шага,
+ * должны исполниться ПОСЛЕ fan-out (напр. final с depends_on:[build]).
+ *
+ * `allIds` — полный набор id (включая fan_out-шаги), по которым раскручиваем зависимости.
+ */
+function transitiveDependents(
+  steps: { id: string; depends_on: string[] }[],
+  roots: Set<string>,
+): Set<string> {
+  // Обратный граф: для каждого шага — кто на него ссылается в depends_on.
+  const reverse = new Map<string, Set<string>>();
+  for (const s of steps) {
+    for (const dep of s.depends_on) {
+      if (!reverse.has(dep)) reverse.set(dep, new Set());
+      reverse.get(dep)!.add(s.id);
+    }
+  }
+  const result = new Set<string>();
+  const queue = [...roots];
+  while (queue.length > 0) {
+    const cur = queue.pop()!;
+    const dependents = reverse.get(cur);
+    if (!dependents) continue;
+    for (const d of dependents) {
+      if (!result.has(d)) {
+        result.add(d);
+        queue.push(d);
+      }
+    }
+  }
+  return result;
 }
 
 /**
@@ -285,11 +328,9 @@ export function buildLoadedWorkflow(wf: Workflow): LoadedWorkflow {
   const allPre = resolveWorkflow(wf.steps);
   assertCrossFamilyReview(allPre);
 
-  // Разделить: обычные шаги идут в preLevels, fan_out-шаги — в fanOuts.
+  // Разделить: обычные шаги идут в preLevels/postFanOutLevels, fan_out-шаги — в fanOuts.
   const plainSteps = allPre.filter((s) => !s.fan_out);
   const fanOutSteps = allPre.filter((s) => s.fan_out);
-  const preLevels = topoLevels(plainSteps);
-  for (const level of preLevels) assertNonOverlappingPaths(level);
 
   const fanOuts: FanOutSpec[] = fanOutSteps.map((s) => ({
     step: s,
@@ -300,6 +341,27 @@ export function buildLoadedWorkflow(wf: Workflow): LoadedWorkflow {
   if (fanOuts.length > 1) {
     throw new Error("Only one fan_out step per workflow is supported (YAGNI)");
   }
+
+  // Разбить plain-шаги вокруг fan_out: шаги, транзитивно зависящие от fan_out-шага
+  // (напр. final с depends_on:[build]), исполняются ПОСЛЕ fan-out. Остальные — до.
+  // allPre включается целиком (с fan_out-шагами), чтобы transitiveDependents видел
+  // зависимости через id fan_out-шага (build). reverse-граф строится по depends_on.
+  let prePlain = plainSteps;
+  let postFanOutPlain: ResolvedStep[] = [];
+  if (fanOutSteps.length > 0) {
+    const fanOutIds = new Set(fanOutSteps.map((s) => s.id));
+    const afterIds = transitiveDependents(
+      allPre.map((s) => ({ id: s.id, depends_on: s.depends_on })),
+      fanOutIds,
+    );
+    prePlain = plainSteps.filter((s) => !afterIds.has(s.id));
+    postFanOutPlain = plainSteps.filter((s) => afterIds.has(s.id));
+  }
+
+  const preLevels = topoLevels(prePlain);
+  for (const level of preLevels) assertNonOverlappingPaths(level);
+  const postFanOutLevels = topoLevels(postFanOutPlain);
+  for (const level of postFanOutLevels) assertNonOverlappingPaths(level);
 
   let loopBody: ResolvedStep[] = [];
   let loop: Loop | undefined;
@@ -330,5 +392,5 @@ export function buildLoadedWorkflow(wf: Workflow): LoadedWorkflow {
 
   // allSteps = pre + loop + post (для stepIdx/context). stepIdx сквозной.
   const allSteps = [...allPre, ...loopBody, ...postSteps];
-  return { wf, preLevels, loopBody, loop, postLevels, allSteps, fanOuts };
+  return { wf, preLevels, postFanOutLevels, loopBody, loop, postLevels, allSteps, fanOuts };
 }

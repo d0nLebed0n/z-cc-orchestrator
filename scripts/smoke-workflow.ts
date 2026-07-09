@@ -38,8 +38,11 @@ assert(loaded.fanOuts[0]!.fromPlanId === "plan", "fromPlanId=plan");
 // fan_out step NOT in preLevels
 const preIds = loaded.preLevels.flat().map((s) => s.id);
 assert(!preIds.includes("build"), "fan_out excluded from preLevels");
-// plan + final still in preLevels
-assert(preIds.includes("plan") && preIds.includes("final"), "plan+final in preLevels");
+// plan runs BEFORE fan-out (in preLevels); final depends on build → runs AFTER fan-out.
+assert(preIds.includes("plan"), "plan in preLevels (before fan-out)");
+assert(!preIds.includes("final"), "final NOT in preLevels (depends on fan_out)");
+const postFanOutIds = loaded.postFanOutLevels.flat().map((s) => s.id);
+assert(postFanOutIds.includes("final"), "final in postFanOutLevels (after fan-out)");
 
 // errors
 function expectThrow(label: string, fn: () => unknown): void {
