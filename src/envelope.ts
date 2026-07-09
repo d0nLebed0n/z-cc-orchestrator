@@ -33,8 +33,8 @@ export type Budget = z.infer<typeof BudgetSchema>;
 
 export const TaskEnvelopeSchema = z.object({
   id: z.string().min(1),
-  agent: z.enum(["claude", "codex", "glm"]),
-  family: z.enum(["anthropic", "openai", "zai"]),
+  agent: z.enum(["claude", "codex", "glm", "ollama"]),
+  family: z.enum(["anthropic", "openai", "zai", "local"]),
   role: RoleSchema,
   prompt: z.string().min(1),
   /** Ограничивает область работы воркера (для worktree/targeting). */

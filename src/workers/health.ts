@@ -232,6 +232,14 @@ export async function checkHealth(
       return checkCodex();
     case "glm":
       return checkGlm(glmEnv);
+    case "ollama":
+      // Реальная health-проверка Ollama (probe /api/tags) — в более поздней задаче.
+      return {
+        agent: "ollama",
+        healthy: false,
+        checks: [],
+        reason: "ollama health check not implemented (later task)",
+      };
   }
 }
 

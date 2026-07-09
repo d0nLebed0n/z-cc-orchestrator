@@ -53,6 +53,21 @@ function main(): void {
   validateEnvelope(env);
   console.log("✓ validateEnvelope(glm) ok");
 
+  // local / ollama
+  assert(AGENTS.ollama.family === "local", "ollama → local");
+  assert(!validReviewerFamilies("anthropic").includes("local"), "local is NOT a reviewer for anthropic");
+  assert(!validReviewerFamilies("openai").includes("local"), "local is NOT a reviewer for openai");
+  assert(validReviewerFamilies("local").includes("anthropic"), "local code → anthropic can review");
+  assert(!validReviewerFamilies("local").includes("local"), "local cannot self-review");
+
+  const ollamaEnv = makeEnvelope({
+    id: "T-OLLAMA", agent: "ollama", role: "implement", prompt: "x",
+    target_paths: ["src/a.ts"], context: null,
+    budget: { wall_time_sec: 600, max_steps: 2 }, effort: "low",
+  });
+  assert(ollamaEnv.family === "local", "envelope.ollama → family local");
+  validateEnvelope(ollamaEnv);
+
   // Envelope family mismatch → throws
   try {
     makeEnvelope({

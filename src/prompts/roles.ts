@@ -25,6 +25,8 @@ function agentIdentity(agent: AgentName, family: Family): string {
       return "Codex (OpenAI)";
     case "glm":
       return "GLM (Z.ai)";
+    case "ollama":
+      return "Qwen3-Coder (local, via Ollama)";
   }
 }
 

@@ -12,6 +12,10 @@ export const WORKERS: Record<AgentName, WorkerFn> = {
   claude: runClaude,
   codex: runCodex,
   glm: runGlm,
+  // ollama worker (runOllama tool-loop) — реализован в более поздней задаче.
+  ollama: async () => {
+    throw new Error("runOllama not implemented (later task)");
+  },
 };
 
 export function getWorker(agent: AgentName): WorkerFn {
