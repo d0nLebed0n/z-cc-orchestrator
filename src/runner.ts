@@ -50,6 +50,26 @@ import { buildWorkerPrompt } from "./prompts/roles.ts";
 import { checkHealthForAgents, formatHealthReport } from "./workers/health.ts";
 import type { AgentName } from "./families.ts";
 
+/** Ограниченный пул конкурентности: не больше maxParallel одновременно. Сохраняет порядок результатов. */
+export async function runBounded<T, U>(
+  items: T[],
+  maxParallel: number,
+  fn: (item: T, index: number) => Promise<U>,
+): Promise<U[]> {
+  const results: U[] = new Array(items.length);
+  let next = 0;
+  async function worker(): Promise<void> {
+    while (true) {
+      const i = next++;
+      if (i >= items.length) return;
+      results[i] = await fn(items[i]!, i);
+    }
+  }
+  const n = Math.max(1, Math.min(maxParallel, items.length));
+  await Promise.all(Array.from({ length: n }, () => worker()));
+  return results;
+}
+
 export interface RunOptions {
   workflowPath: string;
   prompt: string;
