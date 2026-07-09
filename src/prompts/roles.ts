@@ -116,6 +116,31 @@ function implementPrompt(agent: AgentName, family: Family): string {
   ].join("\n");
 }
 
+/** Роль implement для ollama: не пишет код прозой, а зовёт tools. */
+function ollamaImplementPrompt(): string {
+  return [
+    commonHeader("ollama", "local"),
+    "",
+    "ROLE: IMPLEMENTER (local model, tool-loop)",
+    "You implement the task by calling TOOLS. You CANNOT edit files by writing prose —",
+    "you MUST use the tools below. The runner executes each tool call and returns the result.",
+    "",
+    "AVAILABLE TOOLS (emit EXACTLY this format to call one):",
+    "  <tools>{\"name\":\"read_file\",\"arguments\":{\"path\":\"<rel-path>\"}}</tools>",
+    "  <tools>{\"name\":\"write_file\",\"arguments\":{\"path\":\"<rel-path>\",\"content\":\"<full file content>\"}}</tools>",
+    "  <tools>{\"name\":\"list_dir\",\"arguments\":{\"path\":\"<rel-path>\"}}</tools>",
+    "",
+    "RULES:",
+    "- Use read_file/list_dir to inspect before writing. Paths are relative to the worktree root.",
+    "- write_file writes the FULL file content (no diffs). Keep edits minimal but complete.",
+    "- One tool call per <tools> block. Wait for the result before the next call.",
+    "- When done, emit a final summary message with NO <tools> block (plain text).",
+    "- Do NOT call a tool you just called with the same args (it will be deduped).",
+    "",
+    "SUCCESS: files are written and your final message summarizes what changed.",
+  ].join("\n");
+}
+
 /** Роль review: читает код автора (из другой семьи) и возвращает замечания. */
 function reviewPrompt(agent: AgentName, family: Family): string {
   return [
@@ -250,6 +275,7 @@ const ROLE_PROMPTS: Record<Role, (agent: AgentName, family: Family) => string> =
 
 /** Получить system prompt для роли и агента. */
 export function systemPromptFor(role: Role, agent: AgentName, family: Family): string {
+  if (agent === "ollama" && role === "implement") return ollamaImplementPrompt();
   const fn = ROLE_PROMPTS[role];
   if (!fn) throw new Error(`No system prompt for role: ${role}`);
   return fn(agent, family);
