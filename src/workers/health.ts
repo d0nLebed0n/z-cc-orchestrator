@@ -30,6 +30,8 @@ export interface HealthResult {
 const CLAUDE_BIN = process.env.CLAUDE_BIN ?? "claude";
 const CODEX_BIN =
   process.env.CODEX_BIN ?? "/Applications/Codex.app/Contents/Resources/codex";
+const OLLAMA_BASE_URL =
+  process.env.OLLAMA_BASE_URL ?? "http://d0nlebed0n.tail74ba62.ts.net:11434";
 
 /** Запустить команду с таймаутом, вернуть ok + stdout. */
 async function tryRun(
@@ -218,6 +220,40 @@ async function checkGlm(glmEnv?: Record<string, string>): Promise<HealthResult> 
   };
 }
 
+// ─── ollama ────────────────────────────────────────────────────────────────
+
+async function checkOllama(): Promise<HealthResult> {
+  const checks: HealthResult["checks"] = [];
+  // 1. base url set
+  checks.push({
+    name: "base_url",
+    ok: !!OLLAMA_BASE_URL,
+    detail: OLLAMA_BASE_URL,
+  });
+  // 2. /api/tags reachable
+  try {
+    const res = await fetch(`${OLLAMA_BASE_URL}/api/tags`, { method: "GET" });
+    const ok = res.ok;
+    let detail = `HTTP ${res.status}`;
+    if (ok) {
+      const data = (await res.json()) as { models?: { name: string }[] };
+      const names = (data.models ?? []).map((m) => m.name);
+      detail = `reachable, ${names.length} model(s)`;
+    }
+    checks.push({ name: "reachable", ok, detail });
+  } catch (e) {
+    checks.push({ name: "reachable", ok: false, detail: e instanceof Error ? e.message : String(e) });
+  }
+  const healthy = checks.every((c) => c.ok);
+  const failed = checks.filter((c) => !c.ok);
+  return {
+    agent: "ollama",
+    healthy,
+    checks,
+    reason: healthy ? null : failed.map((c) => `${c.name}: ${c.detail}`).join("; "),
+  };
+}
+
 // ─── публичный API ─────────────────────────────────────────────────────────
 
 /** Проверить здоровье одного агента. */
@@ -233,13 +269,7 @@ export async function checkHealth(
     case "glm":
       return checkGlm(glmEnv);
     case "ollama":
-      // Реальная health-проверка Ollama (probe /api/tags) — в более поздней задаче.
-      return {
-        agent: "ollama",
-        healthy: false,
-        checks: [],
-        reason: "ollama health check not implemented (later task)",
-      };
+      return checkOllama();
   }
 }
 
