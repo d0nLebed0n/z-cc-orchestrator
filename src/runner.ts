@@ -197,6 +197,7 @@ async function runWorkerOnly(
   prompt: string,
   projectPath: string,
   glmEnv: Record<string, string> | undefined,
+  ollamaEnv: Record<string, string> | undefined,
   breaker: CircuitBreaker,
   allSteps: ResolvedStep[],
   o: WorkerOnlyOpts = {},
@@ -261,9 +262,15 @@ async function runWorkerOnly(
     allow_same_family: step.allow_same_family,
   });
 
+  // env для воркера: glm → glmEnv (base url + key), ollama → ollamaEnv.
+  // ВАЖНО: runOllama также читает OLLAMA_BASE_URL/OLLAMA_MODEL напрямую из
+  // process.env (Task 11 выставляет их через dotenv из .env.local). ollamaEnv
+  // передаётся сюда для forward-compat — но реальная проводка через process.env.
+  const envFor = step.agent === "glm" ? glmEnv : step.agent === "ollama" ? ollamaEnv : undefined;
+
   const workerOpts: WorkerRunOptions = {
     cwd,
-    env: step.agent === "glm" ? glmEnv : undefined,
+    env: envFor,
   };
 
   const worker = getWorker(step.agent);
@@ -407,6 +414,7 @@ async function runStep(
   projectPath: string,
   integrationWtPath: string,
   glmEnv: Record<string, string> | undefined,
+  ollamaEnv: Record<string, string> | undefined,
   breaker: CircuitBreaker,
   allSteps: ResolvedStep[],
   iteration = 1,
@@ -438,6 +446,7 @@ async function runStep(
     prompt,
     projectPath,
     glmEnv,
+    ollamaEnv,
     breaker,
     allSteps,
     { iteration, cwdOverride, contextOverride: ctx },
@@ -597,13 +606,12 @@ async function runFanOut(
       family: AGENTS[agent].family,
       target_paths: subtask.target_paths,
     };
-    // env для воркера: glm → glmEnv (runWorkerOnly передаёт как opts.env при agent==="glm");
-    // ollama → process.env (runOllama читает напрямую; ollamaEnv должен быть уже в process.env).
-    const envFor = agent === "glm" ? glmEnv : agent === "ollama" ? ollamaEnv : undefined;
+    // env для воркера: runWorkerOnly сам выбирает glm→glmEnv / ollama→ollamaEnv
+    // по step.agent. ollama также читает process.env напрямую (Task 11 — dotenv).
     const { result, stepId, wt } = await runWorkerOnly(
       taskId, implStep, stepIdx,
       `${subtask.goal}\n\nACCEPTANCE CRITERIA: ${subtask.acceptance_criteria}`,
-      projectPath, envFor, breaker, allSteps,
+      projectPath, glmEnv, ollamaEnv, breaker, allSteps,
       { subtaskSuffix: `~${subtask.id}` },
     );
     // Коммитим правки в implement-ветку (чтобы они ушли в merge на Phase B), но НЕ мержим.
@@ -686,7 +694,7 @@ async function runFanOut(
     };
     const rr = await runWorkerOnly(
       taskId, reviewStep, stepIdx, buildReviewPrompt(item.subtask),
-      projectPath, undefined, breaker, allSteps,
+      projectPath, undefined, undefined, breaker, allSteps,
       { subtaskSuffix: `~${item.subtask.id}r`, cwdOverride: candidate.worktreePath, skipWorktree: true },
     );
     const verdict = await parseVerdict(taskId, rr.stepId);
@@ -798,13 +806,13 @@ export async function runWorkflow(opts: RunOptions): Promise<RunResult> {
     if (concurrency > 1) {
       const results = await Promise.all(
         level.map((step) =>
-          runStep(task.id, step, allSteps.indexOf(step), opts.prompt, projectPath, integration.worktreePath, opts.glmEnv, breaker, allSteps),
+          runStep(task.id, step, allSteps.indexOf(step), opts.prompt, projectPath, integration.worktreePath, opts.glmEnv, ollamaEnv, breaker, allSteps),
         ),
       );
       if (!results.every((r) => r.result.success)) overallSuccess = false;
     } else {
       for (const step of level) {
-        const r = await runStep(task.id, step, allSteps.indexOf(step), opts.prompt, projectPath, integration.worktreePath, opts.glmEnv, breaker, allSteps);
+        const r = await runStep(task.id, step, allSteps.indexOf(step), opts.prompt, projectPath, integration.worktreePath, opts.glmEnv, ollamaEnv, breaker, allSteps);
         if (!r.result.success) {
           overallSuccess = false;
           break; // На последовательном уровне — не продолжаем после провала (HITL).
@@ -835,7 +843,7 @@ export async function runWorkflow(opts: RunOptions): Promise<RunResult> {
       for (const step of level) {
         const r = await runStep(
           task.id, step, allSteps.indexOf(step), opts.prompt,
-          projectPath, integration.worktreePath, opts.glmEnv, breaker, allSteps,
+          projectPath, integration.worktreePath, opts.glmEnv, ollamaEnv, breaker, allSteps,
         );
         if (!r.result.success) {
           overallSuccess = false;
@@ -877,7 +885,7 @@ export async function runWorkflow(opts: RunOptions): Promise<RunResult> {
         }
         const r = await runStep(
           task.id, step, allSteps.indexOf(step), opts.prompt,
-          projectPath, integration.worktreePath, opts.glmEnv, breaker, allSteps,
+          projectPath, integration.worktreePath, opts.glmEnv, ollamaEnv, breaker, allSteps,
           iteration, contextOverride,
         );
         if (!r.result.success) {
@@ -929,7 +937,7 @@ export async function runWorkflow(opts: RunOptions): Promise<RunResult> {
       for (const step of level) {
         const r = await runStep(
           task.id, step, allSteps.indexOf(step), opts.prompt,
-          projectPath, integration.worktreePath, opts.glmEnv, breaker, allSteps,
+          projectPath, integration.worktreePath, opts.glmEnv, ollamaEnv, breaker, allSteps,
         );
         if (!r.result.success) {
           overallSuccess = false;
