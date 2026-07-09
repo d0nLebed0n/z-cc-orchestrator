@@ -404,8 +404,14 @@ async function runStep(
     cwdOverride = integrationWtPath;
   }
 
-  // context пробрасываем как override, чтобы линейный путь получил ровно то же
-  // значение, что и раньше (contextOverride !== undefined ? contextOverride : contextFromPrevStep).
+  // context считаем ЗДЕСЬ, как старый runStep: явный override > contextFromPrevStep.
+  // ВАЖНО: передаём конкретное string|null, а не сырой contextOverride (который
+  // для review/final === undefined). Иначе runWorkerOnly при cwdOverride !== undefined
+  // вернёт null и дропнет контекст рецензента (имплементация предыдущего шага).
+  const ctx =
+    contextOverride !== undefined
+      ? contextOverride
+      : await contextFromPrevStep(taskId, step, allSteps, iteration);
   const { result, stepId, output, wt } = await runWorkerOnly(
     taskId,
     step,
@@ -415,7 +421,7 @@ async function runStep(
     glmEnv,
     breaker,
     allSteps,
-    { iteration, cwdOverride, contextOverride },
+    { iteration, cwdOverride, contextOverride: ctx },
   );
 
   // Merge worktree в integration после успеха (только для editing-ролей — у
