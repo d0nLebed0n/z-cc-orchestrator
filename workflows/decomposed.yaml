@@ -1,0 +1,30 @@
+name: decomposed
+description: |
+  Claude декомпозирует → fan-out на glm (сложное) + ollama (простое),
+  каждая подзадача независимо ревьётся codex.
+complexity_threshold: 80
+max_parallel: 3
+
+steps:
+  - id: plan
+    agent: claude
+    role: plan
+    effort: high
+    budget: { wall_time_sec: 900, max_steps: 2 }
+    depends_on: []
+
+  - id: build
+    fan_out: true
+    from_plan: plan
+    agents: [glm, ollama]
+    review: true
+    role: implement
+    depends_on: [plan]
+    budget: { wall_time_sec: 1200, max_steps: 2 }
+
+  - id: final
+    agent: claude
+    role: final
+    effort: high
+    budget: { wall_time_sec: 900, max_steps: 2 }
+    depends_on: [build]
