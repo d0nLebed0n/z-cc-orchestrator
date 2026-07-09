@@ -139,40 +139,84 @@ interface StepRun {
   output: string;
 }
 
-/** Запустить один шаг: worktree → envelope → воркер → сигналы → blackboard. */
-async function runStep(
+/** Результат runWorkerOnly: передаёт результат воркера + handle созданного worktree. */
+interface WorkerOnlyResult {
+  result: WorkerResult;
+  stepId: string;
+  output: string;
+  /** Созданный worktree (для editing-ролей на линейном пути), либо null
+   *  (review/final, или когда caller передал cwdOverride/skipWorktree). */
+  wt: WorktreeHandle | null;
+  /** cwd, в котором воркер реально работал. */
+  cwd: string;
+}
+
+/** Опции runWorkerOnly. На линейном пути runStep выставляет iteration +
+ *  cwdOverride (для review/final) + contextOverride (для plan в loop). */
+interface WorkerOnlyOpts {
+  iteration?: number;
+  /** Суффикс подзадачи в stepId ("~P1" / "~P1r") и в имени ветки. Для fan-out. */
+  subtaskSuffix?: string;
+  /** Запустить воркер в этом cwd вместо создания worktree (review/final на
+   *  линейном пути — integration-worktree; кандидатный review при fan-out). */
+  cwdOverride?: string;
+  /** Не создавать worktree вовсе (использовать cwdOverride). */
+  skipWorktree?: boolean;
+  /** Явный context (для цикла: раннер сам считает по итерации).
+   *  Если undefined → contextFromPrevStep (для editing-ролей) или null
+   *  (для review-in-candidate при fan-out). */
+  contextOverride?: string | null;
+}
+
+/**
+ * Часть шага БЕЗ merge: worktree setup (для editing-ролей) → circuit check →
+ * envelope → воркер + ретраи → writeResult → checkpoint → breaker record →
+ * step record. НЕ делает commit/merge/cleanup — это забота вызывающего
+ * (runStep на линейном пути; Task 10 — для fan-out).
+ *
+ * Возвращает { result, stepId, output, wt, cwd }. Вызывающий по wt решает,
+ * нужно ли commit→merge→removeWorktree (линейный путь) или отложить merge
+ * (фаза A fan-out).
+ */
+async function runWorkerOnly(
   taskId: string,
   step: ResolvedStep,
   stepIdx: number,
   prompt: string,
   projectPath: string,
-  integrationWtPath: string,
   glmEnv: Record<string, string> | undefined,
   breaker: CircuitBreaker,
   allSteps: ResolvedStep[],
-  iteration = 1,
-  /** Явный context (для цикла: раннер сам считает по итерации). Если undefined — contextFromPrevStep. */
-  contextOverride?: string | null,
-): Promise<StepRun> {
-  const stepId = newStepId(taskId, stepIdx + 1, iteration);
+  o: WorkerOnlyOpts = {},
+): Promise<WorkerOnlyResult> {
+  const iteration = o.iteration ?? 1;
+  const baseStepId = newStepId(taskId, stepIdx + 1, iteration);
+  const stepId = o.subtaskSuffix ? `${baseStepId}${o.subtaskSuffix}` : baseStepId;
+
+  // context: явный override (loop plan) > contextFromPrevStep (editing) > null
+  // (review-in-candidate при fan-out — контекст уже влит в промпт вызывающим).
   const context =
-    contextOverride !== undefined
-      ? contextOverride
-      : await contextFromPrevStep(taskId, step, allSteps, iteration);
+    o.contextOverride !== undefined
+      ? o.contextOverride
+      : o.cwdOverride === undefined
+        ? await contextFromPrevStep(taskId, step, allSteps, iteration)
+        : null;
 
   // worktree для правящих ролей (implement/refine/fix) — свой, на ветке агента.
-  // review/final — работают в integration-worktree, где виден смерженный код
-  //  (иначе reviewer смотрит на пустой main и не видит работу implementer-а).
+  // review/final на линейном пути не создают worktree: runStep выставляет
+  // cwdOverride = integrationWtPath. При fan-out кандидатный review тоже идёт
+  // через cwdOverride (caller).
   let wt: WorktreeHandle | null = null;
-  let cwd = projectPath;
-  if (["implement", "refine", "fix"].includes(step.role)) {
-    wt = await createWorktree(projectPath, taskId, step.agent);
-    cwd = wt.path;
-  } else if (["review", "final"].includes(step.role)) {
-    // integration-worktree уже создан в setupIntegration; в нём HEAD = integration,
-    // и смерженные коммиты видны. Обновим до последнего merge перед review.
-    await git(integrationWtPath, ["merge", "--ff-only", integrationBranch(taskId)]).catch(() => {});
-    cwd = integrationWtPath;
+  let cwd = o.cwdOverride ?? projectPath;
+  if (!o.skipWorktree && !o.cwdOverride) {
+    if (["implement", "refine", "fix"].includes(step.role)) {
+      const branchAgent = o.subtaskSuffix ? `${step.agent}${o.subtaskSuffix}` : step.agent;
+      wt = await createWorktree(projectPath, taskId, branchAgent);
+      cwd = wt.path;
+    }
+    // review/final: без cwdOverride сюда не доходим на линейном пути (runStep
+    // всегда выставляет cwdOverride = integrationWtPath). При fan-out кандидатный
+    // review тоже идёт через cwdOverride.
   }
 
   // Собрать полный промпт: system(роль, агент) + context + task пользователя.
@@ -227,6 +271,8 @@ async function runStep(
       },
       stepId,
       output: "",
+      wt,
+      cwd,
     };
   }
 
@@ -328,12 +374,57 @@ async function runStep(
     await upsertStep(taskId, record);
   }
 
-  // Merge worktree в integration после успеха.
-  // Сначала коммитим все правки воркера — иначе они потеряются при worktree remove.
+  return { result, stepId, output: result.output, wt, cwd };
+}
+
+/** Запустить один шаг (ЛИНЕЙНЫЙ путь): runWorkerOnly → commit → merge → cleanup.
+ *  Делегирует worker-часть в runWorkerOnly; сама делает только integration-merge
+ *  для review/final (до запуска воркера) и commit+merge+removeWorktree после успеха. */
+async function runStep(
+  taskId: string,
+  step: ResolvedStep,
+  stepIdx: number,
+  prompt: string,
+  projectPath: string,
+  integrationWtPath: string,
+  glmEnv: Record<string, string> | undefined,
+  breaker: CircuitBreaker,
+  allSteps: ResolvedStep[],
+  iteration = 1,
+  /** Явный context (для цикла: раннер сам считает по итерации). Если undefined — contextFromPrevStep. */
+  contextOverride?: string | null,
+): Promise<StepRun> {
+  // review/final: работают в integration-worktree, где виден смерженный код
+  //  (иначе reviewer смотрит на пустой main и не видит работу implementer-а).
+  //  Обновим integration до последнего merge, затем передадим cwdOverride в
+  //  runWorkerOnly, чтобы оно не создавало собственный worktree.
+  let cwdOverride: string | undefined;
+  if (["review", "final"].includes(step.role)) {
+    await git(integrationWtPath, ["merge", "--ff-only", integrationBranch(taskId)]).catch(() => {});
+    cwdOverride = integrationWtPath;
+  }
+
+  // context пробрасываем как override, чтобы линейный путь получил ровно то же
+  // значение, что и раньше (contextOverride !== undefined ? contextOverride : contextFromPrevStep).
+  const { result, stepId, output, wt } = await runWorkerOnly(
+    taskId,
+    step,
+    stepIdx,
+    prompt,
+    projectPath,
+    glmEnv,
+    breaker,
+    allSteps,
+    { iteration, cwdOverride, contextOverride },
+  );
+
+  // Merge worktree в integration после успеха (только для editing-ролей — у
+  //  review/final wt === null). Сначала коммитим все правки воркера, иначе они
+  //  потеряются при worktree remove.
   if (wt && result.success) {
     const committed = await commitAllInWorktree(
       wt,
-      `orch(${step.agent}/${step.role}): ${envelope.id}`,
+      `orch(${step.agent}/${step.role}): ${stepId}`,
     );
     if (!committed) {
       await logEvent({
@@ -356,7 +447,7 @@ async function runStep(
     await removeWorktree(projectPath, wt);
   }
 
-  return { result, stepId, output: result.output };
+  return { result, stepId, output };
 }
 
 /** Точка входа раннера: запустить воркфлоу над проектом. */
