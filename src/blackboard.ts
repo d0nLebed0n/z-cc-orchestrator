@@ -182,6 +182,41 @@ export function newStepId(taskId: string, n: number, iteration = 1): string {
   return iteration > 1 ? `${base}#${iteration}` : base;
 }
 
+/** Fan-out подзадача: суффикс ~<subtaskId>, review добавляет r. Сегмент `~`, не `#` (# = итерация цикла). */
+export function newSubtaskStepId(baseStepId: string, subtaskId: string, isReview = false): string {
+  return `${baseStepId}~${subtaskId}${isReview ? "r" : ""}`;
+}
+
+/** Разобрать stepId на сегменты: <base>[#<iteration>][~<subtask>[r]]. */
+export interface StepSegments {
+  base: string;
+  iteration: number | null;
+  subtask: string | null;
+  isReview: boolean;
+}
+export function parseStepSegments(stepId: string): StepSegments {
+  const tildeIdx = stepId.indexOf("~");
+  const hashIdx = stepId.indexOf("#");
+  const base = stepId.slice(0, Math.min(
+    tildeIdx === -1 ? stepId.length : tildeIdx,
+    hashIdx === -1 ? stepId.length : hashIdx,
+  ));
+  let iteration: number | null = null;
+  let subtask: string | null = null;
+  let isReview = false;
+  if (hashIdx !== -1) {
+    const after = stepId.slice(hashIdx + 1, tildeIdx === -1 ? stepId.length : tildeIdx);
+    iteration = Number.parseInt(after, 10);
+    if (Number.isNaN(iteration)) iteration = null;
+  }
+  if (tildeIdx !== -1) {
+    let after = stepId.slice(tildeIdx + 1);
+    if (after.endsWith("r")) { isReview = true; after = after.slice(0, -1); }
+    subtask = after || null;
+  }
+  return { base, iteration, subtask, isReview };
+}
+
 // ─── results / checkpoints / log ───────────────────────────────────────────
 
 export async function writeResult(
