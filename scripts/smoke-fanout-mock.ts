@@ -19,6 +19,8 @@ import {
   createCandidateWorktree,
   promoteCandidateToIntegration,
   discardCandidate,
+  setupIntegration,
+  removeIntegrationWorktree,
   integrationBranch,
 } from "../src/worktree.ts";
 import { routeSubtask, pathsOverlap, buildLoadedWorkflow, WorkflowSchema } from "../src/workflow.ts";
@@ -86,9 +88,13 @@ function gitSha(args: string[], cwd: string): string {
 }
 
 // --- сценарий APPROVE: promote продвигает integration ---
+// ВАЖНО: как и реальный раннер (setupIntegration), держим integration-WORKTREE
+// открытым на протяжении всего сценария. Это и есть РЕАЛЬНОЕ ограничение, на
+// котором валится `git branch -f` (git запрещает force-update ветки, checked out
+// в любом worktree). Старый smoke этого не делал — отсюда ложная уверенность.
 const root1 = freshRepo();
 const taskId = "T-MOCK";
-execFileSync("git", ["branch", integrationBranch(taskId), "main"], { cwd: root1, encoding: "utf8" });
+const integration1 = await setupIntegration(root1, taskId, "main");
 // implement-ветка: ollama написал a.ts (симуляция Phase A: commit без merge).
 // Имя ветки: '.' вместо '~' (git ref-format не допускает '~'); stepId при этом
 // использует '~' (это имя файла, не ref). См. runWorkerOnly branchAgent-санитацию.
@@ -107,8 +113,8 @@ const candidate = await createCandidateWorktree(root1, taskId, "P1");
 execFileSync("git", ["merge", "--no-ff", implBranch, "-m", "candidate merge"], { cwd: candidate.worktreePath, encoding: "utf8" });
 assert(readFileSync(join(candidate.worktreePath, "a.ts"), "utf8") === "export const x = 1;", "candidate worktree has impl file after merge");
 
-// promote → integration fast-forwarded to candidate tip.
-const prom = await promoteCandidateToIntegration(root1, taskId, candidate);
+// promote → integration продвинута ЧЕРЕЗ integration-worktree (ff-only merge).
+const prom = await promoteCandidateToIntegration(root1, taskId, candidate, integration1.worktreePath);
 assert(prom.ok, "promote ok: " + prom.message);
 const integrationAfter = gitSha(["rev-parse", integrationBranch(taskId)], root1);
 assert(integrationAfter !== integrationBefore, "integration advanced after promote");
@@ -117,11 +123,13 @@ const aContent = execFileSync("git", ["show", `${integrationBranch(taskId)}:a.ts
 assert(aContent === "export const x = 1;", "integration contains merged a.ts");
 // candidate worktree удалён.
 assert(!existsSync(candidate.worktreePath), "candidate worktree removed after promote");
+// cleanup integration-worktree этого сценария.
+await removeIntegrationWorktree(root1, integration1.worktreePath);
 
 // --- сценарий REJECT: discard НЕ продвигает integration ---
 const root2 = freshRepo();
 const taskId2 = "T-REJ";
-execFileSync("git", ["branch", integrationBranch(taskId2), "main"], { cwd: root2, encoding: "utf8" });
+const integration2 = await setupIntegration(root2, taskId2, "main");
 const implBranch2 = `orch/${taskId2}/glm.P2`;
 execFileSync("git", ["branch", implBranch2, integrationBranch(taskId2)], { cwd: root2, encoding: "utf8" });
 execFileSync("git", ["checkout", "-q", implBranch2], { cwd: root2, encoding: "utf8" });
@@ -141,11 +149,12 @@ assert(!existsSync(candidate2.worktreePath), "candidate worktree removed after d
 // candidate-ветка удалена.
 const branches2 = execFileSync("git", ["branch", "--list"], { cwd: root2, encoding: "utf8" });
 assert(!branches2.includes(`cand-P2`), "candidate branch deleted after discard");
+await removeIntegrationWorktree(root2, integration2.worktreePath);
 
 // --- сценарий два последовательных promote (P3, P4) — ff-цепочка без гонки ---
 const root3 = freshRepo();
 const taskId3 = "T-SEQ";
-execFileSync("git", ["branch", integrationBranch(taskId3), "main"], { cwd: root3, encoding: "utf8" });
+const integration3 = await setupIntegration(root3, taskId3, "main");
 async function approveSubtask(subId: string, file: string, content: string): Promise<void> {
   const ib = `orch/${taskId3}/ollama.${subId}`;
   execFileSync("git", ["branch", ib, integrationBranch(taskId3)], { cwd: root3, encoding: "utf8" });
@@ -156,7 +165,7 @@ async function approveSubtask(subId: string, file: string, content: string): Pro
   execFileSync("git", ["checkout", "-q", "main"], { cwd: root3, encoding: "utf8" });
   const cand = await createCandidateWorktree(root3, taskId3, subId);
   execFileSync("git", ["merge", "--no-ff", ib, "-m", `candidate merge ${subId}`], { cwd: cand.worktreePath, encoding: "utf8" });
-  const r = await promoteCandidateToIntegration(root3, taskId3, cand);
+  const r = await promoteCandidateToIntegration(root3, taskId3, cand, integration3.worktreePath);
   assert(r.ok, `promote ${subId} ok`);
 }
 await approveSubtask("P3", "c.ts", "export const c = 3;");
@@ -166,6 +175,7 @@ const cContent = execFileSync("git", ["show", `${integrationBranch(taskId3)}:c.t
 const dContent = execFileSync("git", ["show", `${integrationBranch(taskId3)}:d.ts`], { cwd: root3, encoding: "utf8" }).trim();
 assert(cContent === "export const c = 3;", "sequential promote: integration has c.ts (P3)");
 assert(dContent === "export const d = 4;", "sequential promote: integration has d.ts (P4)");
+await removeIntegrationWorktree(root3, integration3.worktreePath);
 
 // cleanup temp repos
 rmSync(root1, { recursive: true, force: true });

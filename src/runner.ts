@@ -691,12 +691,15 @@ async function runFanOut(
     );
     const verdict = await parseVerdict(taskId, rr.stepId);
     if (verdict === "APPROVE" || verdict === "ACCEPT") {
-      // APPROVE → продвигаем candidate в integration (ff), cleanup candidate.
-      const prom = await promoteCandidateToIntegration(projectPath, taskId, candidate);
+      // APPROVE → продвигаем candidate в integration (ff через integration-worktree), cleanup candidate.
+      const prom = await promoteCandidateToIntegration(projectPath, taskId, candidate, integrationWtPath);
       if (prom.ok) {
         summaries.push(`- ${item.subtask.id}: APPROVE (codex)`);
       } else {
-        // promote провалился — candidate уже мог быть частично зачищен; считаем провалом.
+        // promote провалился — ff-merge упал ДО cleanup, значит candidate worktree+ветка
+        // ещё живы. Вызываем discardCandidate, чтобы не было утечки (он идемпотентен —
+        // все git/rm обёрнуты в .catch). Считаем провалом.
+        await discardCandidate(projectPath, candidate);
         failed.push(item.subtask.id);
         allApproved = false;
         summaries.push(`- ${item.subtask.id}: APPROVE but promote FAILED (${prom.message})`);

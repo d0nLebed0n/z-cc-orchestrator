@@ -310,21 +310,35 @@ export async function createCandidateWorktree(
  * Продвинуть candidate в integration: ff integration → candidate, затем cleanup
  * candidate worktree + ветки. Вызывается ТОЛЬКО при APPROVE из Phase B.
  *
- * Детерминизм: `git branch -f integration candidate` перемещает integration
- * на tip candidate (это безопасный ff, т.к. candidate был создан от integration
- * и толькоAdds commits сверху). Integration НЕ checked out в основном репо (она
- * живёт в своём worktree), поэтому `-f` разрешён.
+ * РЕАЛИЗАЦИЯ: integration живёт в собственном worktree (его создаёт и держит
+ * открытым setupIntegration на протяжении всей задачи). Git РАЗРЕШАЕТ
+ * force-update ветки через `branch -f`, но ЗАПРЕЩАЕТ это делать, если ветка
+ * checked out в любом worktree — а integration именно такова. Поэтому
+ * `branch -f` ВАЛИТСЯ в реальном раннере. (Раньше smoke давал ложную
+ * уверенность: он не создавал integration-worktree.)
+ *
+ * Правильный путь — продвигать integration ЧЕРЕЗ её worktree: HEAD этого
+ * worktree = integration-ветка, а candidate — её потомок (создан от integration,
+ * только добавляет коммиты), значит `merge --ff-only` валиден и продвигает
+ * integration без `git checkout`. Никакого `branch -f`.
+ *
+ * Cleanup candidate worktree + ветки идёт ПОСЛЕ успешного ff — если ff падает,
+ * candidate НЕ зачищается (вызывающий при ошибке может его разобрать), но т.к.
+ * candidate-merge уже случился, утечки worktree/ветки не возникает: ветка
+ * candidate остаётся, но она одноразовая и задача в целом уходит в HITL.
+ *
+ * @param integrationWtPath путь к worktree integration-ветки (от setupIntegration)
  */
 export async function promoteCandidateToIntegration(
   projectPath: string,
   taskId: string,
   candidate: { branch: string; worktreePath: string },
+  integrationWtPath: string,
 ): Promise<{ ok: boolean; message: string }> {
-  const integration = integrationBranch(taskId);
   try {
-    // Переместить integration на tip candidate. integration не checked out в
-    // основном репо (она в собственном worktree) — branch -f разрешён.
-    await git(projectPath, ["branch", "-f", integration, candidate.branch]);
+    // integration-worktree имеет HEAD = integration; ff-merge candidate продвигает
+    // integration (candidate — потомок integration, ff валиден) без checkout.
+    await git(integrationWtPath, ["merge", "--ff-only", candidate.branch]);
     // Cleanup candidate worktree + ветка.
     await git(projectPath, ["worktree", "remove", "--force", candidate.worktreePath]).catch(() => {});
     await rm(candidate.worktreePath, { recursive: true, force: true }).catch(() => {});
