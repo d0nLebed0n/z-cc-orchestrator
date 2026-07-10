@@ -92,7 +92,23 @@ export const WorkflowSchema = z.object({
     }
   }
   return true;
-}, { message: "fan_out.from_plan must reference an earlier step id" });
+}, { message: "fan_out.from_plan must reference an earlier step id" })
+// review #5 (Codex): не-fan_out шаг обязан иметь agent (иначе тихо получает
+// placeholder "claude" в resolveWorkflow — скрытая ошибка конфигурации).
+.refine(
+  (w) => w.steps.every((s) => s.fan_out || s.agent !== undefined),
+  { message: "non-fan_out steps require an agent" },
+)
+// fan_out разрешён только в pre-loop steps (не в loop.steps / post_steps) —
+// динамическое раскрытие внутри цикла/post не поддерживается (YAGNI).
+.refine(
+  (w) => w.loop === undefined || w.loop.steps.every((s) => !s.fan_out),
+  { message: "fan_out is not allowed inside loop.steps (only in pre-loop steps)" },
+)
+.refine(
+  (w) => w.post_steps.every((s) => !s.fan_out),
+  { message: "fan_out is not allowed in post_steps (only in pre-loop steps)" },
+);
 export type Workflow = z.infer<typeof WorkflowSchema>;
 
 /** Дополненный шаг: family выводится из агента. agent всегда определён

@@ -5,7 +5,9 @@
 import { z } from "zod";
 
 export const SubtaskSchema = z.object({
-  id: z.string().min(1),
+  // git-ref-safe: id участвует в step ids и candidate branch names (cand-<id>).
+  // Запрещаем /, ~, .., whitespace и др. ref-invalid символы (review #6).
+  id: z.string().regex(/^[A-Za-z0-9_-]+$/, "subtask id must be git-ref-safe ([A-Za-z0-9_-]+)"),
   title: z.string().min(1),
   goal: z.string().min(1),
   complexity: z.number().int().min(0).max(100),

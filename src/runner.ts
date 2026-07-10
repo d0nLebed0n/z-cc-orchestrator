@@ -683,10 +683,12 @@ async function runFanOut(
     const { stdout: names } = await git(candidate.worktreePath, ["diff", "--name-only", integrationBranch(taskId), candidate.branch])
       .catch(() => ({ stdout: "" }));
     const changed = names.trim().split("\n").filter(Boolean);
+    // S3 (Codex review): используем pathsOverlap (нормализация + parent/child),
+    // не raw-сравнение — иначе ./src/a.ts vs src/a.ts классифицируются непоследовательно.
     const outOfScope = changed.filter((f) => {
       const tp = item.subtask.target_paths;
       if (tp.length === 0) return false; // нет target_paths → не ограничиваем
-      return !tp.some((p) => f === p || f.startsWith(p + "/") || p.startsWith(f + "/"));
+      return !pathsOverlap([f], tp);
     });
     if (outOfScope.length > 0) {
       await escalateHitl({

@@ -33,4 +33,13 @@ try {
 }
 catch { console.log("✓ duplicate subtask ids rejected"); }
 
+// git-ref-unsafe ids → reject (review #6): /, ~, .., whitespace break branch names
+for (const badId of ["P/1", "P~1", "P 1", "P.1", "a/b", "P:1"]) {
+  try {
+    parsePlan(`{"subtasks":[{"id":"${badId}","title":"t","goal":"g","complexity":10,"target_paths":["a.ts"],"acceptance_criteria":"ok"}]}`);
+    console.error("✗ unsafe subtask id should throw: " + badId); process.exit(1);
+  }
+  catch { console.log("✓ unsafe subtask id rejected: " + badId); }
+}
+
 console.log("\nAll plan checks passed.");
