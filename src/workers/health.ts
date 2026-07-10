@@ -27,11 +27,14 @@ export interface HealthResult {
   reason: string | null;
 }
 
-const CLAUDE_BIN = process.env.CLAUDE_BIN ?? "claude";
+// Runtime-геттеры (review #2): env читается при вызове check*, не при импорте.
+// ESM imports в cli.ts выполняются до loadEnv(.env.local) — module-level const
+// захватили бы пустой process.env.
+const claudeBin = (): string => process.env.CLAUDE_BIN ?? "claude";
 // Codex переехал из Codex.app в ChatGPT.app (OpenAI merged standalone app).
-const CODEX_BIN =
+const codexBin = (): string =>
   process.env.CODEX_BIN ?? "/Applications/ChatGPT.app/Contents/Resources/codex";
-const OLLAMA_BASE_URL =
+const ollamaBaseUrl = (): string =>
   process.env.OLLAMA_BASE_URL ?? "http://d0nlebed0n.tail74ba62.ts.net:11434";
 
 /** Запустить команду с таймаутом, вернуть ok + stdout. */
@@ -64,18 +67,19 @@ async function checkInPath(cmd: string): Promise<boolean> {
 
 async function checkClaude(): Promise<HealthResult> {
   const checks: HealthResult["checks"] = [];
+  const bin = claudeBin();
 
   // 1. Бинарник доступен
-  const inPath = await checkInPath(CLAUDE_BIN);
+  const inPath = await checkInPath(bin);
   checks.push({
     name: "binary_available",
     ok: inPath,
-    detail: inPath ? CLAUDE_BIN : `${CLAUDE_BIN} not found`,
+    detail: inPath ? bin : `${bin} not found`,
   });
 
   // 2. Версия (быстрый вызов, проверяет что CLI запускается)
   if (inPath) {
-    const v = await tryRun(CLAUDE_BIN, ["--version"], 15000);
+    const v = await tryRun(bin, ["--version"], 15000);
     checks.push({
       name: "version_runs",
       ok: v.ok,
@@ -89,7 +93,7 @@ async function checkClaude(): Promise<HealthResult> {
   const firstTwoOk = checks.slice(0, 2).every((c) => c.ok);
   if (firstTwoOk) {
     const probe = await tryRun(
-      CLAUDE_BIN,
+      bin,
       ["-p", "Reply with: OK", "--output-format", "text"],
       30000,
     );
@@ -118,18 +122,19 @@ async function checkClaude(): Promise<HealthResult> {
 
 async function checkCodex(): Promise<HealthResult> {
   const checks: HealthResult["checks"] = [];
+  const bin = codexBin();
 
   // 1. Бинарник
-  const inPath = await checkInPath(CODEX_BIN);
+  const inPath = await checkInPath(bin);
   checks.push({
     name: "binary_available",
     ok: inPath,
-    detail: inPath ? CODEX_BIN : `${CODEX_BIN} not found (set CODEX_BIN)`,
+    detail: inPath ? bin : `${bin} not found (set CODEX_BIN)`,
   });
 
   // 2. Версия (CLI запускается)
   if (inPath) {
-    const v = await tryRun(CODEX_BIN, ["--version"], 15000);
+    const v = await tryRun(bin, ["--version"], 15000);
     checks.push({
       name: "version_runs",
       ok: v.ok,
@@ -142,7 +147,7 @@ async function checkCodex(): Promise<HealthResult> {
   //    что даёт false positive. `login status` корректно работает без tty.
   //    ВАЖНО: codex пишет "Logged in using ChatGPT" в STDERR, не stdout.
   if (inPath) {
-    const login = await tryRun(CODEX_BIN, ["login", "status"], 15000);
+    const login = await tryRun(bin, ["login", "status"], 15000);
     const combined = `${login.stdout} ${login.stderr}`;
     const loggedIn = /logged in/i.test(combined);
     checks.push({
@@ -185,17 +190,18 @@ async function checkGlm(glmEnv?: Record<string, string>): Promise<HealthResult> 
   });
 
   // 2. Бинарник claude доступен (glm использует его)
-  const inPath = await checkInPath(CLAUDE_BIN);
+  const cbin = claudeBin();
+  const inPath = await checkInPath(cbin);
   checks.push({
     name: "claude_binary",
     ok: inPath,
-    detail: inPath ? CLAUDE_BIN : "claude not found",
+    detail: inPath ? cbin : "claude not found",
   });
 
   // 3. Реальный проб: claude -p с GLM env отвечает.
   if (hasEnv && inPath) {
     const probe = await tryRun(
-      CLAUDE_BIN,
+      cbin,
       ["-p", "Reply with: OK", "--output-format", "text"],
       30000,
       glmEnv,
@@ -225,15 +231,16 @@ async function checkGlm(glmEnv?: Record<string, string>): Promise<HealthResult> 
 
 async function checkOllama(): Promise<HealthResult> {
   const checks: HealthResult["checks"] = [];
+  const base = ollamaBaseUrl();
   // 1. base url set
   checks.push({
     name: "base_url",
-    ok: !!OLLAMA_BASE_URL,
-    detail: OLLAMA_BASE_URL,
+    ok: !!base,
+    detail: base,
   });
   // 2. /api/tags reachable
   try {
-    const res = await fetch(`${OLLAMA_BASE_URL}/api/tags`, { method: "GET" });
+    const res = await fetch(`${base}/api/tags`, { method: "GET" });
     const ok = res.ok;
     let detail = `HTTP ${res.status}`;
     if (ok) {

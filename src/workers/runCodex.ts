@@ -27,8 +27,9 @@ const execFileAsync = promisify(execFile);
 
 // Codex CLI: OpenAI влил standalone Codex.app в ChatGPT.app (версия 0.144.0+).
 // Старый путь /Applications/Codex.app/.../codex больше не существует.
-// Переопределяется env CODEX_BIN (см. .env.local, docs/versions.md).
-const CODEX_BIN =
+// Runtime-геттер (review #2): env читается при вызове, не при импорте (ESM
+// imports в cli.ts идут до loadEnv). Переопределяется env CODEX_BIN.
+const codexBin = (): string =>
   process.env.CODEX_BIN ?? "/Applications/ChatGPT.app/Contents/Resources/codex";
 
 async function gitHasChanges(cwd: string): Promise<boolean> {
@@ -72,7 +73,7 @@ export const runCodex: WorkerFn = async (envelope, opts) => {
     envelope.prompt,
   ];
 
-  const res = await runWithTimeout(CODEX_BIN, args, {
+  const res = await runWithTimeout(codexBin(), args, {
     cwd: opts.cwd,
     env: opts.env,
     timeoutSec,

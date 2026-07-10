@@ -17,7 +17,8 @@ import { runWithTimeout, truncate } from "./spawn.ts";
 
 const execFileAsync = promisify(execFile);
 
-const CLAUDE_BIN = process.env.CLAUDE_BIN ?? "claude";
+// Runtime-геттер (review #2): env читается при вызове, не при импорте.
+const claudeBin = (): string => process.env.CLAUDE_BIN ?? "claude";
 
 /** Роли, которые должны править файлы — для сигнала #3. */
 const EDITING_ROLES = new Set(["implement", "refine", "fix"]);
@@ -43,7 +44,7 @@ export const runClaude: WorkerFn = async (envelope, opts) => {
     envelope.prompt,
   ];
 
-  const res = await runWithTimeout(CLAUDE_BIN, args, {
+  const res = await runWithTimeout(claudeBin(), args, {
     cwd: opts.cwd,
     env: opts.env,
     timeoutSec,

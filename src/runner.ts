@@ -789,9 +789,12 @@ export async function runWorkflow(opts: RunOptions): Promise<RunResult> {
   // ─── Health gate: проверить все агенты воркфлоу ДО создания задачи ───
   // point #8: uniqueAgents ДОЛЖНЫ включать fanOuts[].agents — иначе ollama
   // (если он есть только в fan_out) не пройдёт health-check и упадёт на запуске.
+  // review #1 (Codex): при fan_out.review codex — динамический ревьюер, его
+  // нет в agents, но он зовётся на каждой подзадаче. Добавляем явно.
   const uniqueAgents = Array.from(new Set([
     ...allSteps.filter((s) => !s.fan_out).map((s) => s.agentName),
     ...fanOuts.flatMap((f) => f.agents),
+    ...fanOuts.filter((f) => f.review).map(() => "codex" as AgentName),
   ]));
   const healthResults = await checkHealthForAgents(uniqueAgents, opts.glmEnv);
   const unhealthy: AgentName[] = [];

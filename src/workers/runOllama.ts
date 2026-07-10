@@ -14,8 +14,13 @@ import { truncate } from "./spawn.ts";
 
 const execFileAsync = promisify(execFile);
 
-const OLLAMA_BASE_URL = process.env.OLLAMA_BASE_URL ?? "http://d0nlebed0n.tail74ba62.ts.net:11434";
-const OLLAMA_MODEL =
+// Runtime-геттеры (review #2): env читается в момент вызова воркера, а не при
+// импорте модуля. ESM imports в cli.ts выполняются ДО loadEnv(.env.local), и
+// module-level const захватили бы пустой process.env. Дефолты совпадают с
+// .env.local, но переопределение (другой хост/модель) требует runtime-чтения.
+const ollamaBaseUrl = (): string =>
+  process.env.OLLAMA_BASE_URL ?? "http://d0nlebed0n.tail74ba62.ts.net:11434";
+const ollamaModel = (): string =>
   process.env.OLLAMA_MODEL ?? "danielsheep/Qwen3-Coder-30B-A3B-Instruct-1M-Unsloth:UD-IQ3_XXS";
 
 const EDITING_ROLES = new Set(["implement", "refine", "fix"]);
@@ -38,12 +43,12 @@ async function chat(messages: ChatMessage[], timeoutMs: number): Promise<string>
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
-    const res = await fetch(`${OLLAMA_BASE_URL}/v1/chat/completions`, {
+    const res = await fetch(`${ollamaBaseUrl()}/v1/chat/completions`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       signal: ctrl.signal,
       body: JSON.stringify({
-        model: OLLAMA_MODEL,
+        model: ollamaModel(),
         messages,
         stream: false,
         temperature: 0,
