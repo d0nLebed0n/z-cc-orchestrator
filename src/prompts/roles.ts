@@ -55,8 +55,8 @@ function commonHeader(agent: AgentName, family: Family): string {
 }
 
 /** Роль plan: декомпозиция задачи в список подзадач. Не пишет код. */
-function planPrompt(agent: AgentName, family: Family): string {
-  return [
+function planPrompt(agent: AgentName, family: Family, fanOut = false): string {
+  const base = [
     commonHeader(agent, family),
     "",
     "ROLE: PLANNER",
@@ -77,15 +77,30 @@ function planPrompt(agent: AgentName, family: Family): string {
     "  map it to a concrete subtask that fixes that specific issue.",
     "- Keep subtasks that the review did not object to.",
     "- The goal is to close every Blocker so the next review returns APPROVE.",
+  ];
+
+  if (fanOut) {
+    // decomposed-воркфлоу: раннер парсит JSON, markdown НЕ допускается.
+    return base.concat([
+      "",
+      "OUTPUT FORMAT (STRICT JSON — the runner parses it, no prose, no markdown plan):",
+      "This is a FAN-OUT workflow: each subtask runs as an independent worker.",
+      "You MUST decompose into >=1 subtask and emit ONLY a JSON object (optionally",
+      "in a ```json fence). Do NOT emit a markdown ## Plan — it will be rejected.",
+      '  { "subtasks": [ { "id": "P1", "title": "...", "goal": "...", "complexity": 0-100, "target_paths": ["..."], "acceptance_criteria": "..." } ] }',
+      "  complexity: 0=trivial (single fn, 1-2 files, isolated), 100=architectural (multiple modules, cross-cutting).",
+      "  Do NOT include the agent — the runner routes each subtask by complexity vs threshold.",
+      "  Even a small task must be at least 1 subtask in JSON form.",
+      "",
+      "SUCCESS CRITERION: valid JSON SubtaskPlan. If genuinely impossible, emit",
+      '{ "subtasks": [] } with a risk note — but prefer decomposing.',
+    ]).join("\n");
+  }
+
+  // linear-воркфлоу: markdown-план.
+  return base.concat([
     "",
-    "OUTPUT FORMAT — DECOMPOSED WORKFLOWS (strict JSON — the runner parses it)",
-    "when the task will be fan-out to multiple workers. Emit JSON ONLY in that case:",
-    "Return ONLY a JSON object (optionally in a ```json fence):",
-    '  { "subtasks": [ { "id": "P1", "title": "...", "goal": "...", "complexity": 0-100, "target_paths": ["..."], "acceptance_criteria": "..." } ] }',
-    "  complexity: 0=trivial (single fn, 1-2 files), 100=architectural (multiple modules).",
-    "  Do NOT include the agent — the runner routes each subtask by complexity vs threshold.",
-    "",
-    "OUTPUT FORMAT — LINEAR (non-fanout) WORKFLOWS (markdown, fallback):",
+    "OUTPUT FORMAT (markdown):",
     "```",
     "## Plan",
     "1. [agent] <subtask> — target_paths: [...]",
@@ -97,7 +112,7 @@ function planPrompt(agent: AgentName, family: Family): string {
     "",
     "SUCCESS CRITERION: a reviewer can implement each subtask without further questions.",
     "If the task is too ambiguous to plan, output \"## Risks\" with the blocker and stop.",
-  ].join("\n");
+  ]).join("\n");
 }
 
 /** Роль implement: пишет код по плану/задаче. */
@@ -281,8 +296,9 @@ const ROLE_PROMPTS: Record<Role, (agent: AgentName, family: Family) => string> =
 };
 
 /** Получить system prompt для роли и агента. */
-export function systemPromptFor(role: Role, agent: AgentName, family: Family): string {
+export function systemPromptFor(role: Role, agent: AgentName, family: Family, fanOut = false): string {
   if (agent === "ollama" && role === "implement") return ollamaImplementPrompt();
+  if (role === "plan") return planPrompt(agent, family, fanOut);
   const fn = ROLE_PROMPTS[role];
   if (!fn) throw new Error(`No system prompt for role: ${role}`);
   return fn(agent, family);
@@ -302,8 +318,10 @@ export function buildWorkerPrompt(input: {
   context: string | null;
   /** Пути, ограничивающие область работы. */
   targetPaths?: string[];
+  /** true для воркфлоу с fan_out — plan обязан выдать строгий JSON SubtaskPlan. */
+  fanOut?: boolean;
 }): string {
-  const system = systemPromptFor(input.role, input.agent, input.family);
+  const system = systemPromptFor(input.role, input.agent, input.family, input.fanOut);
   const parts: string[] = [system, "", "---", ""];
 
   if (input.targetPaths && input.targetPaths.length > 0) {

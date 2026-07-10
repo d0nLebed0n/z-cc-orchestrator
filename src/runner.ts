@@ -174,6 +174,8 @@ interface WorkerOnlyOpts {
   cwdOverride?: string;
   /** Не создавать worktree вовсе (использовать cwdOverride). */
   skipWorktree?: boolean;
+  /** true для plan-шага в fan-out воркфлоу — требовать строгий JSON SubtaskPlan. */
+  fanOut?: boolean;
   /** Явный context (для цикла: раннер сам считает по итерации).
    *  Если undefined → contextFromPrevStep (для editing-ролей) или null
    *  (для review-in-candidate при fan-out). */
@@ -241,6 +243,8 @@ async function runWorkerOnly(
 
   // Собрать полный промпт: system(роль, агент) + context + task пользователя.
   // Воркер получает готовый промпт, не сырую задачу (PLAN §5.2).
+  // Для plan-шага, питающего fan_out, требуем строгий JSON SubtaskPlan.
+  const fanOutPlan = o.fanOut ?? (step.role === "plan" && allSteps.some((s) => s.fan_out && s.from_plan === step.id));
   const fullPrompt = buildWorkerPrompt({
     role: step.role,
     agent: step.agentName,
@@ -248,6 +252,7 @@ async function runWorkerOnly(
     task: prompt,
     context,
     targetPaths: step.target_paths,
+    fanOut: fanOutPlan,
   });
 
   const envelope: TaskEnvelope = makeEnvelope({

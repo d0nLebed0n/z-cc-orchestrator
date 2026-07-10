@@ -80,9 +80,43 @@ export function parseToolCalls(content: string): ToolCall[] {
 function tryParseJson(s: string): unknown {
   try { return JSON.parse(s); }
   catch {
-    try { return JSON.parse(s.replace(/,\s*}/g, "}").replace(/,\s*]/g, "]")); }
-    catch { return null; }
+    // LLM часто выдаёт сырые newlines/tabs внутри строковых значений (невалидный
+    // JSON). Пробуем нормализовать: внутри строк — заменить на escape-последовательности.
+    try { return JSON.parse(sanitizeJsonStrings(s)); }
+    catch {
+      try { return JSON.parse(sanitizeJsonStrings(s).replace(/,\s*}/g, "}").replace(/,\s*]/g, "]")); }
+      catch { return null; }
+    }
   }
+}
+
+/**
+ * Заменить сырые control-символы (\n \r \t) внутри строковых литералов JSON на
+ * escape-последовательности. Символы ВНЕ строк (между токенами) не трогаем —
+ * там newlines валидны. Решает проблему, когда LLM пишет multi-line content
+ * прямо в JSON-строке.
+ */
+function sanitizeJsonStrings(s: string): string {
+  let out = "";
+  let inStr = false;
+  let esc = false;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i]!;
+    if (inStr) {
+      if (esc) { out += c; esc = false; continue; }
+      if (c === "\\") { out += c; esc = true; continue; }
+      if (c === '"') { out += c; inStr = false; continue; }
+      // Сырой control-символ внутри строки → escape.
+      if (c === "\n") { out += "\\n"; continue; }
+      if (c === "\r") { out += "\\r"; continue; }
+      if (c === "\t") { out += "\\t"; continue; }
+      out += c;
+    } else {
+      if (c === '"') inStr = true;
+      out += c;
+    }
+  }
+  return out;
 }
 
 /**
@@ -113,7 +147,12 @@ function extractJsonObjects(s: string): unknown[] {
             try {
               results.push(JSON.parse(candidate));
             } catch {
-              // не JSON — пропускаем
+              // Возможно, внутри строк сырые newlines (LLM) — нормализуем.
+              try {
+                results.push(JSON.parse(sanitizeJsonStrings(candidate)));
+              } catch {
+                // не JSON — пропускаем
+              }
             }
             break;
           }
