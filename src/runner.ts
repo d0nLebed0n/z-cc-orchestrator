@@ -587,16 +587,21 @@ async function runFanOut(
       });
     }
   }
-  // target_paths пересечение (строгий v1 — HITL, не пытаемся упорядочить).
+  // target_paths пересечение — merge-first (ослабление v1).
+  // Раньше блокировали upfront (строгий запрет), но реальные задачи (напр.
+  // Nest.js бэкенд) неминуемо пересекаются на общих файлах (app.module.ts,
+  // package.json). Теперь разрешаем: Phase B мержит подзадачи последовательно
+  // в candidate, и только ФАКТИЧЕСКИЙ git-конфликт → discard + failed.
+  // Логируем пересечение как warn — для наблюдаемости.
   for (let i = 0; i < routed.length; i++) {
     for (let j = i + 1; j < routed.length; j++) {
       if (pathsOverlap(routed[i]!.subtask.target_paths, routed[j]!.subtask.target_paths)) {
-        await escalateHitl({
-          task_id: taskId, step_id: null,
-          reason: `fan_out: target_paths overlap between ${routed[i]!.subtask.id} and ${routed[j]!.subtask.id}`,
-          detail: { a: routed[i]!.subtask.target_paths, b: routed[j]!.subtask.target_paths },
+        await logEvent({
+          task_id: taskId, step_id: null, level: "warn",
+          kind: "fanout_path_overlap",
+          message: `target_paths overlap between ${routed[i]!.subtask.id} and ${routed[j]!.subtask.id} — will rely on merge-first (git conflict → fail that subtask)`,
+          data: { a: routed[i]!.subtask.target_paths, b: routed[j]!.subtask.target_paths },
         });
-        return { allApproved: false, failedSubtasks: ["(path overlap)"] };
       }
     }
   }
