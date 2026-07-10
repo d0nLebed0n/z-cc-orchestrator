@@ -804,10 +804,11 @@ export async function runWorkflow(opts: RunOptions): Promise<RunResult> {
     const parallelizable = level.length > 1;
     const concurrency = parallelizable ? Math.min(level.length, effectiveMaxParallel) : 1;
     if (concurrency > 1) {
-      const results = await Promise.all(
-        level.map((step) =>
-          runStep(task.id, step, allSteps.indexOf(step), opts.prompt, projectPath, integration.worktreePath, opts.glmEnv, ollamaEnv, breaker, allSteps),
-        ),
+      // runBounded ограничивает параллельность реальным потолком (review #2):
+      // Promise.all(level.map(...)) запускал бы весь уровень разом, игнорируя
+      // effectiveMaxParallel. runBounded сохраняет порядок результатов.
+      const results = await runBounded(level, concurrency, (step) =>
+        runStep(task.id, step, allSteps.indexOf(step), opts.prompt, projectPath, integration.worktreePath, opts.glmEnv, ollamaEnv, breaker, allSteps),
       );
       if (!results.every((r) => r.result.success)) overallSuccess = false;
     } else {
