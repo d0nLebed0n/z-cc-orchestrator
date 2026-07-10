@@ -810,14 +810,34 @@ export async function runWorkflow(opts: RunOptions): Promise<RunResult> {
     );
   }
 
+  // ─── Валидация target-репо ДО создания задачи ───
+  // setupIntegration делает `git branch <integration> main` — падает на репо
+  // без коммитов (main не валидный object). Проверяем upfront, чтобы дать
+  // понятную ошибку, а не бросать необработанное исключение посреди задачи.
+  try {
+    await git(projectPath, ["rev-parse", "--verify", "HEAD"]);
+  } catch {
+    throw new Error(
+      `Target project is not a usable git repo (no commits on HEAD): ${projectPath}\n` +
+      `Make at least one commit before running a workflow (orchestrator creates branches off HEAD).`,
+    );
+  }
+
   const task = await createTask({
     prompt: opts.prompt,
     workflow: opts.workflowPath,
     project: projectPath,
     status: "running",
   });
-  // Integration живёт в собственном worktree — НЕ трогаем HEAD основного репо.
-  const integration = await setupIntegration(projectPath, task.id);
+
+  // Оборачиваем тело в try/catch: при ЛЮБОЙ необработанной ошибке (напр.
+  // git-падение в setupIntegration/merge) ставить задаче status=failed и
+  // логировать, а не бросать наружу — иначе задача висит в running навсегда.
+  let integration: { branch: string; worktreePath: string } | null = null;
+  try {
+    // Integration живёт в собственном worktree — НЕ трогает HEAD основного репо.
+    integration = await setupIntegration(projectPath, task.id);
+    const integrationWtPath = integration.worktreePath;
 
   const breaker = new CircuitBreaker(3);
   let overallSuccess = true;
@@ -831,12 +851,12 @@ export async function runWorkflow(opts: RunOptions): Promise<RunResult> {
       // Promise.all(level.map(...)) запускал бы весь уровень разом, игнорируя
       // effectiveMaxParallel. runBounded сохраняет порядок результатов.
       const results = await runBounded(level, concurrency, (step) =>
-        runStep(task.id, step, allSteps.indexOf(step), opts.prompt, projectPath, integration.worktreePath, opts.glmEnv, ollamaEnv, breaker, allSteps),
+        runStep(task.id, step, allSteps.indexOf(step), opts.prompt, projectPath, integrationWtPath, opts.glmEnv, ollamaEnv, breaker, allSteps),
       );
       if (!results.every((r) => r.result.success)) overallSuccess = false;
     } else {
       for (const step of level) {
-        const r = await runStep(task.id, step, allSteps.indexOf(step), opts.prompt, projectPath, integration.worktreePath, opts.glmEnv, ollamaEnv, breaker, allSteps);
+        const r = await runStep(task.id, step, allSteps.indexOf(step), opts.prompt, projectPath, integrationWtPath, opts.glmEnv, ollamaEnv, breaker, allSteps);
         if (!r.result.success) {
           overallSuccess = false;
           break; // На последовательном уровне — не продолжаем после провала (HITL).
@@ -853,7 +873,7 @@ export async function runWorkflow(opts: RunOptions): Promise<RunResult> {
     for (const spec of fanOuts) {
       const fo = await runFanOut(
         task.id, spec, allSteps, opts.prompt, projectPath,
-        integration.worktreePath, opts.glmEnv, ollamaEnv, breaker,
+        integrationWtPath, opts.glmEnv, ollamaEnv, breaker,
         threshold, effectiveMaxParallel,
       );
       if (!fo.allApproved) overallSuccess = false;
@@ -867,7 +887,7 @@ export async function runWorkflow(opts: RunOptions): Promise<RunResult> {
       for (const step of level) {
         const r = await runStep(
           task.id, step, allSteps.indexOf(step), opts.prompt,
-          projectPath, integration.worktreePath, opts.glmEnv, ollamaEnv, breaker, allSteps,
+          projectPath, integrationWtPath, opts.glmEnv, ollamaEnv, breaker, allSteps,
         );
         if (!r.result.success) {
           overallSuccess = false;
@@ -909,7 +929,7 @@ export async function runWorkflow(opts: RunOptions): Promise<RunResult> {
         }
         const r = await runStep(
           task.id, step, allSteps.indexOf(step), opts.prompt,
-          projectPath, integration.worktreePath, opts.glmEnv, ollamaEnv, breaker, allSteps,
+          projectPath, integrationWtPath, opts.glmEnv, ollamaEnv, breaker, allSteps,
           iteration, contextOverride,
         );
         if (!r.result.success) {
@@ -966,7 +986,7 @@ export async function runWorkflow(opts: RunOptions): Promise<RunResult> {
       for (const step of level) {
         const r = await runStep(
           task.id, step, allSteps.indexOf(step), opts.prompt,
-          projectPath, integration.worktreePath, opts.glmEnv, ollamaEnv, breaker, allSteps,
+          projectPath, integrationWtPath, opts.glmEnv, ollamaEnv, breaker, allSteps,
         );
         if (!r.result.success) {
           overallSuccess = false;
@@ -986,9 +1006,24 @@ export async function runWorkflow(opts: RunOptions): Promise<RunResult> {
   // Оставляем также ветку (integrationBranch) — она не удаляется здесь в любом случае.
   const fanOutRan = fanOuts.length > 0;
   if (!overallSuccess && !fanOutRan) {
-    await removeIntegrationWorktree(projectPath, integration.worktreePath);
+    await removeIntegrationWorktree(projectPath, integrationWtPath);
   }
 
   const final = (await updateTask(task.id, {})) as TaskRecord;
   return { task: final, success: overallSuccess };
+
+  } catch (err) {
+    // Необработанная ошибка в теле — задача не должна висеть в running.
+    const msg = err instanceof Error ? err.message : String(err);
+    await logEvent({
+      task_id: task.id, step_id: null, level: "error",
+      kind: "runner_uncaught", message: msg,
+    });
+    await updateTask(task.id, { status: "failed" });
+    if (integration) {
+      await removeIntegrationWorktree(projectPath, integration.worktreePath).catch(() => {});
+    }
+    // ^ integration.worktreePath безопасен здесь: внутри if (integration) — TS сужает.
+    throw err; // пере-бросаем: CLI покажет ошибку пользователю.
+  }
 }
