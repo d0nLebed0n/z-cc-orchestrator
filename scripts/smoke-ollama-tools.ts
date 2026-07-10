@@ -24,6 +24,19 @@ assert(parseToolCalls("").length === 0, "empty → empty");
 calls = parseToolCalls("<tools>not json</tools>");
 assert(calls.length === 0, "malformed ignored");
 
+// alt format: markdown-fenced with tool name on first line (30B нестабильность)
+calls = parseToolCalls("I'll create the file.\n\n```typescript\nwrite_file\n{\n  \"path\": \"hello.ts\",\n  \"content\": \"export const x = 1;\"\n}\n```\n\nDone.");
+assert(calls.length === 1 && calls[0]!.name === "write_file" && calls[0]!.args.path === "hello.ts", "parse fenced write_file (alt format)");
+assert(calls[0]!.args.content === "export const x = 1;", "fenced content extracted");
+
+// alt format: file_path instead of path
+calls = parseToolCalls("```json\nwrite_file\n{\"file_path\":\"a.ts\",\"content\":\"x\"}\n```");
+assert(calls.length === 1 && calls[0]!.name === "write_file", "parse fenced with file_path");
+
+// alt format: inline JSON with name+arguments (no tags/fences)
+calls = parseToolCalls('Here: {"name":"read_file","arguments":{"path":"b.ts"}} done');
+assert(calls.length === 1 && calls[0]!.name === "read_file" && calls[0]!.args.path === "b.ts", "parse inline JSON tool call");
+
 // path sanitize
 assert(sanitizePath(join("/root"), "src/a.ts") === join("/root", "src/a.ts"), "relative joined");
 assert(sanitizePath(join("/root"), "/root/src/a.ts") === join("/root", "src/a.ts"), "absolute under root ok");
