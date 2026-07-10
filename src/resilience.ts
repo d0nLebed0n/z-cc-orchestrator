@@ -91,6 +91,9 @@ export async function checkpointFromResult(
   envelope: TaskEnvelope,
   result: WorkerResult,
   root?: string,
+  /** Список изменённых файлов из git status worktree (review #4).
+   *  Раннер заполняет; если не передан — пустой массив (digest беднее). */
+  filesChanged?: string[],
 ): Promise<string> {
   const summary = result.output.slice(0, 4000) || "(empty output)";
   const digest = {
@@ -98,7 +101,7 @@ export async function checkpointFromResult(
     next: result.success
       ? `Continue from step ${envelope.role} (agent ${envelope.agent}).`
       : `Step ${envelope.role} failed (${result.reason}). Retry or escalate.`,
-    files_changed: [], // заполняется раннером из git status при наличии
+    files_changed: filesChanged ?? [],
   };
   const path = await writeCheckpoint(taskId, n, digest, root);
   await logEvent(

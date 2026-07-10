@@ -325,9 +325,14 @@ async function runWorkerOnly(
     record.attempts = consumed.attempts;
 
     // Ретраи в пределах max_steps, если не успех и бюджет не исчерпан.
+    // review #3: таймаут каждой попытки = остаток бюджета (wall_sec_left),
+    // иначе N ретраев по wall_time_sec каждый суммарно превышают бюджет шага.
     let cur = consumed;
     while (!result.success && !cur.exhausted && result.reason !== "error") {
-      const retryResult = await worker(envelope, workerOpts);
+      const { wall_sec_left } = budgetRemaining(cur, envelope);
+      if (wall_sec_left <= 0) break; // бюджет исчерпан — не ретраим
+      const retryOpts: WorkerRunOptions = { ...workerOpts, wallTimeSecOverride: wall_sec_left };
+      const retryResult = await worker(envelope, retryOpts);
       cur = consumeBudget(cur, envelope, retryResult);
       if (retryResult.success) {
         result = retryResult;
@@ -353,7 +358,15 @@ async function runWorkerOnly(
 
     // Checkpoint для codex (§4.3) — раннер пишет digest
     if (step.agent === "codex") {
-      await checkpointFromResult(taskId, stepIdx + 1, envelope, result);
+      // review #4: заполняем files_changed из git status worktree (раньше всегда []).
+      let filesChanged: string[] = [];
+      try {
+        const { stdout: status } = await git(cwd, ["status", "--porcelain"]);
+        filesChanged = status.trim().split("\n").filter(Boolean).map((l) => l.slice(3).trim());
+      } catch {
+        // не git-репо или worktree уже удалён — оставляем []
+      }
+      await checkpointFromResult(taskId, stepIdx + 1, envelope, result, undefined, filesChanged);
     }
 
     // Circuit breaker (§4.2)

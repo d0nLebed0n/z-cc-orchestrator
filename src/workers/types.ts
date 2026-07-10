@@ -40,6 +40,13 @@ export interface WorkerRunOptions {
   env?: Record<string, string>;
   /** Дополнительные флаги CLI. */
   extraArgs?: string[];
+  /**
+   * Override таймаута шага в секундах (review #3).
+   * Если задан — воркер использует его вместо envelope.budget.wall_time_sec.
+   * Раннер передаёт сюда остаток бюджета (budgetRemaining.wall_sec_left) на
+   * ретраях, чтобы суммарное время шага не превышало wall_time_sec.
+   */
+  wallTimeSecOverride?: number;
 }
 
 export type WorkerFn = (envelope: TaskEnvelope, opts: WorkerRunOptions) => Promise<WorkerResult>;

@@ -32,7 +32,9 @@ async function gitHasChanges(cwd: string): Promise<boolean> {
 }
 
 export const runClaude: WorkerFn = async (envelope, opts) => {
-  const timeoutSec = envelope.budget.wall_time_sec;
+  // review #3: на ретраях раннер передаёт остаток бюджета, чтобы шаг не
+  // превышал wall_time_sec суммарно за все попытки.
+  const timeoutSec = opts.wallTimeSecOverride ?? envelope.budget.wall_time_sec;
   const args = [
     "-p", // print/headless режим
     "--output-format",

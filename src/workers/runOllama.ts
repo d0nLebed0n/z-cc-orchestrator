@@ -62,7 +62,9 @@ async function chat(messages: ChatMessage[], timeoutMs: number): Promise<string>
 
 export const runOllama: WorkerFn = async (envelope, opts) => {
   const start = Date.now();
-  const wallMs = envelope.budget.wall_time_sec * 1000;
+  // review #3: на ретраях раннер передаёт остаток бюджета шага.
+  const wallSec = opts.wallTimeSecOverride ?? envelope.budget.wall_time_sec;
+  const wallMs = wallSec * 1000;
   const maxIters = envelope.budget.max_steps * 8;
   const needsEdits = EDITING_ROLES.has(envelope.role);
 

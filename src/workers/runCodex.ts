@@ -41,8 +41,10 @@ async function gitHasChanges(cwd: string): Promise<boolean> {
 }
 
 export const runCodex: WorkerFn = async (envelope, opts) => {
+  // review #3: на ретраях раннер передаёт остаток бюджета шага.
+  const wallSec = opts.wallTimeSecOverride ?? envelope.budget.wall_time_sec;
   const timeoutSec = Math.min(
-    envelope.budget.wall_time_sec,
+    wallSec,
     (envelope.budget.max_session_min ?? 25) * 60,
   );
 
