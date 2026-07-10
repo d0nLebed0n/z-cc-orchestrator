@@ -25,9 +25,11 @@ import { runWithTimeout, truncate } from "./spawn.ts";
 
 const execFileAsync = promisify(execFile);
 
-// macOS Codex.app не в PATH по умолчанию — fallback на полный путь.
+// Codex CLI: OpenAI влил standalone Codex.app в ChatGPT.app (версия 0.144.0+).
+// Старый путь /Applications/Codex.app/.../codex больше не существует.
+// Переопределяется env CODEX_BIN (см. .env.local, docs/versions.md).
 const CODEX_BIN =
-  process.env.CODEX_BIN ?? "/Applications/Codex.app/Contents/Resources/codex";
+  process.env.CODEX_BIN ?? "/Applications/ChatGPT.app/Contents/Resources/codex";
 
 async function gitHasChanges(cwd: string): Promise<boolean> {
   try {

@@ -28,8 +28,9 @@ export interface HealthResult {
 }
 
 const CLAUDE_BIN = process.env.CLAUDE_BIN ?? "claude";
+// Codex переехал из Codex.app в ChatGPT.app (OpenAI merged standalone app).
 const CODEX_BIN =
-  process.env.CODEX_BIN ?? "/Applications/Codex.app/Contents/Resources/codex";
+  process.env.CODEX_BIN ?? "/Applications/ChatGPT.app/Contents/Resources/codex";
 const OLLAMA_BASE_URL =
   process.env.OLLAMA_BASE_URL ?? "http://d0nlebed0n.tail74ba62.ts.net:11434";
 

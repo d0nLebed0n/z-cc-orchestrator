@@ -39,12 +39,13 @@
 | tsx | 4.23.0 | через npx (dev-dependency) |
 | git | 2.50.1 | Apple Git-155 |
 | `claude` | 2.1.202 | `/Users/ilyalebedev/.local/bin/claude` (Claude Code) |
-| `codex` | 0.142.5 | `/Applications/Codex.app/Contents/Resources/codex` |
+| `codex` | 0.144.0-alpha.4 | `/Applications/ChatGPT.app/Contents/Resources/codex` |
 
 ### D-006: Путь к бинарнику codex
-**Дата:** 2026-07-07
+**Дата:** 2026-07-07 (обновлено 2026-07-10)
 **Контекст:** Codex установлен как macOS-приложение, не в PATH для headless-вызова из spawn.
-**Решение:** `CODEX_BIN` по умолчанию = `/Applications/Codex.app/Contents/Resources/codex`. Переопределяется env-переменной `CODEX_BIN`. `codex` недоступен как alias в не-interactive shell (zsh alias не разворачивается в `spawn`).
+**Решение:** `CODEX_BIN` по умолчанию = `/Applications/ChatGPT.app/Contents/Resources/codex`. Переопределяется env-переменной `CODEX_BIN`. `codex` недоступен как alias в не-interactive shell (zsh alias не разворачивается в `spawn`).
+**Обновление 2026-07-10:** OpenAI влил standalone `Codex.app` в `ChatGPT.app`. Старый путь `/Applications/Codex.app/Contents/Resources/codex` больше не существует; дефолт переведён на `ChatGPT.app`. Версия обновлена до `0.144.0-alpha.4`.
 
 ---
 
