@@ -37,6 +37,15 @@ assert(calls.length === 1 && calls[0]!.name === "write_file", "parse fenced with
 calls = parseToolCalls('Here: {"name":"read_file","arguments":{"path":"b.ts"}} done');
 assert(calls.length === 1 && calls[0]!.name === "read_file" && calls[0]!.args.path === "b.ts", "parse inline JSON tool call");
 
+// alt format: fenced JSON with {name, arguments} (```json\n{...}\n```) + file_name
+calls = parseToolCalls('```json\n{\n  "name": "write_file",\n  "arguments": {\n    "file_name": "hello.ts",\n    "content": "export const x = 1;"\n  }\n}\n```');
+assert(calls.length === 1 && calls[0]!.name === "write_file", "parse fenced JSON with name+arguments");
+assert(calls[0]!.args.file_name === "hello.ts", "fenced JSON: file_name arg captured");
+
+// alt format: JS-call style write_file({...}) — модель иногда зовёт tool как функцию
+calls = parseToolCalls('write_file({\n  "path": "hello.ts",\n  "content": "export const x = 1;"\n})');
+assert(calls.length === 1 && calls[0]!.name === "write_file" && calls[0]!.args.path === "hello.ts", "parse JS-call write_file({...})");
+
 // path sanitize
 assert(sanitizePath(join("/root"), "src/a.ts") === join("/root", "src/a.ts"), "relative joined");
 assert(sanitizePath(join("/root"), "/root/src/a.ts") === join("/root", "src/a.ts"), "absolute under root ok");
