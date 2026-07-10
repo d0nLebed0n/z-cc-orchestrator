@@ -29,6 +29,7 @@ import {
   readResult,
   logEvent,
   newStepId,
+  getTask,
   type StepRecord,
   type TaskRecord,
 } from "./blackboard.ts";
@@ -587,16 +588,21 @@ async function runFanOut(
       });
     }
   }
-  // target_paths пересечение (строгий v1 — HITL, не пытаемся упорядочить).
+  // target_paths пересечение — merge-first (ослабление v1).
+  // Раньше блокировали upfront (строгий запрет), но реальные задачи (напр.
+  // Nest.js бэкенд) неминуемо пересекаются на общих файлах (app.module.ts,
+  // package.json). Теперь разрешаем: Phase B мержит подзадачи последовательно
+  // в candidate, и только ФАКТИЧЕСКИЙ git-конфликт → discard + failed.
+  // Логируем пересечение как warn — для наблюдаемости.
   for (let i = 0; i < routed.length; i++) {
     for (let j = i + 1; j < routed.length; j++) {
       if (pathsOverlap(routed[i]!.subtask.target_paths, routed[j]!.subtask.target_paths)) {
-        await escalateHitl({
-          task_id: taskId, step_id: null,
-          reason: `fan_out: target_paths overlap between ${routed[i]!.subtask.id} and ${routed[j]!.subtask.id}`,
-          detail: { a: routed[i]!.subtask.target_paths, b: routed[j]!.subtask.target_paths },
+        await logEvent({
+          task_id: taskId, step_id: null, level: "warn",
+          kind: "fanout_path_overlap",
+          message: `target_paths overlap between ${routed[i]!.subtask.id} and ${routed[j]!.subtask.id} — will rely on merge-first (git conflict → fail that subtask)`,
+          data: { a: routed[i]!.subtask.target_paths, b: routed[j]!.subtask.target_paths },
         });
-        return { allApproved: false, failedSubtasks: ["(path overlap)"] };
       }
     }
   }
@@ -678,30 +684,24 @@ async function runFanOut(
       summaries.push(`- ${item.subtask.id}: FAILED (candidate merge conflict)`);
       continue;
     }
-    // diff guard (point #12): правки только в target_paths подзадачи.
-    // Сравниваем candidate с integration (откуда он создан) — это diff implement-ветки.
+    // diff guard (point #12) — ослаблен: правки вне target_paths логируем как
+    // warn, но НЕ блокируем. Реальные бэкенд-задачи неминуемо выходят за область
+    // (любой новый модуль требует правки app.module.ts). Phase B merge-first
+    // ловит ФАКТИЧЕСКИЕ конфликты при merge в candidate — этого достаточно.
     const { stdout: names } = await git(candidate.worktreePath, ["diff", "--name-only", integrationBranch(taskId), candidate.branch])
       .catch(() => ({ stdout: "" }));
     const changed = names.trim().split("\n").filter(Boolean);
-    // S3 (Codex review): используем pathsOverlap (нормализация + parent/child),
-    // не raw-сравнение — иначе ./src/a.ts vs src/a.ts классифицируются непоследовательно.
-    const outOfScope = changed.filter((f) => {
-      const tp = item.subtask.target_paths;
-      if (tp.length === 0) return false; // нет target_paths → не ограничиваем
-      return !pathsOverlap([f], tp);
-    });
-    if (outOfScope.length > 0) {
-      await escalateHitl({
-        task_id: taskId, step_id: null,
-        reason: `fan_out: subtask ${item.subtask.id} diff out of target_paths`,
-        detail: { outOfScope, target_paths: item.subtask.target_paths },
-      });
-      await discardCandidate(projectPath, candidate);
-      await removeWorktree(projectPath, item.wt);
-      failed.push(item.subtask.id);
-      allApproved = false;
-      summaries.push(`- ${item.subtask.id}: FAILED (diff out of scope)`);
-      continue;
+    const tp = item.subtask.target_paths;
+    if (tp.length > 0) {
+      const outOfScope = changed.filter((f) => !pathsOverlap([f], tp));
+      if (outOfScope.length > 0) {
+        await logEvent({
+          task_id: taskId, step_id: null, level: "warn",
+          kind: "fanout_diff_out_of_scope",
+          message: `subtask ${item.subtask.id} changed files outside target_paths (allowed — merge-first will catch real conflicts)`,
+          data: { outOfScope, target_paths: tp },
+        });
+      }
     }
     // codex-review в candidate-worktree (видит смерженный код). skipWorktree + cwdOverride,
     // чтобы runWorkerOnly не создавал собственный worktree — ревьюер работает в candidate.
@@ -776,6 +776,71 @@ function buildReviewPrompt(subtask: Subtask): string {
   ].join("\n");
 }
 
+/**
+ * Graceful shutdown при внешнем SIGTERM/SIGINT (напр. UI "Остановить",
+ * таймаут Bash, Ctrl+C). Без этого процесс умирает, а задача остаётся в
+ * `running` навсегда (runWorkerOnly не дописывает статус шага).
+ *
+ * Регистрируем ОДИН обработчик после createTask; при сигнале:
+ *  - помечаем висящие running-шаги → failed
+ *  - задача → failed
+ *  - cleanup integration worktree (если уже создан)
+ *  - логируем причину
+ *  - выходим (не блокируем сигнал — позволяем процессу умереть)
+ *
+ * handleRef возвращает функцию снятия регистрации (для нормального пути).
+ */
+export function installShutdownHandler(
+  taskId: string,
+  projectPath: string,
+  integrationRef: { value: { branch: string; worktreePath: string } | null },
+): () => void {
+  const handler = async (sig: NodeJS.Signals) => {
+    // Предотвращаем повторный вход (второй SIGKILL всё равно добьёт).
+    process.removeAllListeners(sig);
+    console.error(`\n⚠ received ${sig} — graceful shutdown of task ${taskId}`);
+    try {
+      // 1. Помечаем висящие running-шаги → failed.
+      const task = await getTask(taskId);
+      if (task) {
+        let changed = false;
+        for (const st of task.steps) {
+          if (st.status === "running") {
+            st.status = "failed";
+            st.finished_at = new Date().toISOString();
+            st.error = `interrupted by ${sig}`;
+            changed = true;
+          }
+        }
+        if (changed) {
+          await updateTask(taskId, { status: "failed", steps: task.steps });
+        } else {
+          await updateTask(taskId, { status: "failed" });
+        }
+        await logEvent({
+          task_id: taskId, step_id: null, level: "error",
+          kind: "graceful_shutdown", message: `task interrupted by ${sig}; marked failed`,
+          data: { interrupted_steps: task.steps.filter((s) => s.error === `interrupted by ${sig}`).map((s) => s.id) },
+        });
+      }
+      // 2. Cleanup integration worktree (ветку оставляем для разбора).
+      if (integrationRef.value) {
+        await removeIntegrationWorktree(projectPath, integrationRef.value.worktreePath).catch(() => {});
+      }
+    } catch (e) {
+      // Даже если не успели записать — не блокируем выход.
+      console.error(`  (shutdown cleanup failed: ${e instanceof Error ? e.message : e})`);
+    }
+    process.exit(130); // 128+SIGINT по конвенции; подойдёт и для SIGTERM.
+  };
+  process.on("SIGTERM", handler);
+  process.on("SIGINT", handler);
+  return () => {
+    process.off("SIGTERM", handler);
+    process.off("SIGINT", handler);
+  };
+}
+
 /** Точка входа раннера: запустить воркфлоу над проектом. */
 export async function runWorkflow(opts: RunOptions): Promise<RunResult> {
   const loaded = await loadWorkflow(opts.workflowPath);
@@ -833,10 +898,17 @@ export async function runWorkflow(opts: RunOptions): Promise<RunResult> {
   // Оборачиваем тело в try/catch: при ЛЮБОЙ необработанной ошибке (напр.
   // git-падение в setupIntegration/merge) ставить задаче status=failed и
   // логировать, а не бросать наружу — иначе задача висит в running навсегда.
+  // integrationRef — обёртка, чтобы shutdown-handler видел актуальное значение
+  // integration (let-переменная не видна в замыкании после reassign).
+  const integrationRef: { value: { branch: string; worktreePath: string } | null } = { value: null };
+  // Graceful shutdown: при внешнем SIGTERM/SIGINT (UI stop, таймаут, Ctrl+C)
+  // помечаем задачу failed и чистим worktree — иначе зависает в running.
+  const removeShutdownHandler = installShutdownHandler(task.id, projectPath, integrationRef);
   let integration: { branch: string; worktreePath: string } | null = null;
   try {
     // Integration живёт в собственном worktree — НЕ трогает HEAD основного репо.
     integration = await setupIntegration(projectPath, task.id);
+    integrationRef.value = integration;
     const integrationWtPath = integration.worktreePath;
 
   const breaker = new CircuitBreaker(3);
@@ -1025,5 +1097,10 @@ export async function runWorkflow(opts: RunOptions): Promise<RunResult> {
     }
     // ^ integration.worktreePath безопасен здесь: внутри if (integration) — TS сужает.
     throw err; // пере-бросаем: CLI покажет ошибку пользователю.
+  } finally {
+    // Нормальный выход — снимаем shutdown-handler, чтобы он не сработал
+    // на последующих задачах (если раннер переиспользуется в одном процессе).
+    removeShutdownHandler();
+    integrationRef.value = null;
   }
 }

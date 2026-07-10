@@ -50,7 +50,11 @@ export const runClaude: WorkerFn = async (envelope, opts) => {
     timeoutSec,
   });
 
-  const output = truncate(res.stdout.trim());
+  // plan-шаг (особенно fan-out) выдаёт JSON SubtaskPlan — для большой задачи
+  // он длиннее 8000, и truncate ломал JSON → parsePlan падал. Для plan не
+  // обрезаем (sidecar-файл вместит; в context потом обрежется до 8000).
+  const isPlan = envelope.role === "plan";
+  const output = isPlan ? res.stdout.trim() : truncate(res.stdout.trim());
   const hasOutput = output.length > 0;
   const needsEdits = EDITING_ROLES.has(envelope.role);
   const hasChanges = needsEdits ? await gitHasChanges(opts.cwd) : null;
