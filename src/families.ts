@@ -6,26 +6,28 @@
  * для правил ревью он чужой по отношению к Anthropic-Claude.
  */
 
-export type Family = "anthropic" | "openai" | "zai";
-export type AgentName = "claude" | "codex" | "glm";
+export type Family = "anthropic" | "openai" | "zai" | "local";
+export type AgentName = "claude" | "codex" | "glm" | "ollama";
 
 export interface AgentInfo {
   name: AgentName;
   family: Family;
-  /** Каким бинарником запускается (справочно, реальный путь — в workers/). */
-  binary: "claude" | "codex";
+  /** Каким бинарником запускается (справочно). local-агенты не имеют CLI — binary "none". */
+  binary: "claude" | "codex" | "ollama" | "none";
 }
 
 export const AGENTS: Record<AgentName, AgentInfo> = {
   claude: { name: "claude", family: "anthropic", binary: "claude" },
   codex: { name: "codex", family: "openai", binary: "codex" },
   glm: { name: "glm", family: "zai", binary: "claude" },
+  ollama: { name: "ollama", family: "local", binary: "ollama" },
 };
 
-/** Все семьи, отличные от данной — валидные ревьюеры. */
+/** Все семьи, отличные от данной и способные ревьюить. local — implement-only, не ревьюер. */
+const REVIEWER_FAMILIES: Family[] = ["anthropic", "openai", "zai"];
+
 export function validReviewerFamilies(author: Family): Family[] {
-  const all: Family[] = ["anthropic", "openai", "zai"];
-  return all.filter((f) => f !== author);
+  return REVIEWER_FAMILIES.filter((f) => f !== author);
 }
 
 /**
@@ -49,14 +51,13 @@ export function pickReviewer(
     }
     return prefer;
   }
-  // Дефолтный выбор: первый подходящий из [claude, codex, glm].
   const valid = validReviewerFamilies(authorFamily);
+  // ollama никогда не ревьюер (local — implement-only); выбираем из сильных семей.
   const candidate: AgentName =
-    valid.find((f) => f === "anthropic") === "anthropic"
-      ? "claude"
-      : valid.find((f) => f === "openai") === "openai"
-        ? "codex"
-        : "glm";
+    valid.includes("anthropic") ? "claude"
+    : valid.includes("openai") ? "codex"
+    : valid.includes("zai") ? "glm"
+    : "claude";
   return candidate;
 }
 

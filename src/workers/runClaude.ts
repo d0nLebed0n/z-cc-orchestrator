@@ -17,7 +17,8 @@ import { runWithTimeout, truncate } from "./spawn.ts";
 
 const execFileAsync = promisify(execFile);
 
-const CLAUDE_BIN = process.env.CLAUDE_BIN ?? "claude";
+// Runtime-геттер (review #2): env читается при вызове, не при импорте.
+const claudeBin = (): string => process.env.CLAUDE_BIN ?? "claude";
 
 /** Роли, которые должны править файлы — для сигнала #3. */
 const EDITING_ROLES = new Set(["implement", "refine", "fix"]);
@@ -32,7 +33,9 @@ async function gitHasChanges(cwd: string): Promise<boolean> {
 }
 
 export const runClaude: WorkerFn = async (envelope, opts) => {
-  const timeoutSec = envelope.budget.wall_time_sec;
+  // review #3: на ретраях раннер передаёт остаток бюджета, чтобы шаг не
+  // превышал wall_time_sec суммарно за все попытки.
+  const timeoutSec = opts.wallTimeSecOverride ?? envelope.budget.wall_time_sec;
   const args = [
     "-p", // print/headless режим
     "--output-format",
@@ -41,7 +44,7 @@ export const runClaude: WorkerFn = async (envelope, opts) => {
     envelope.prompt,
   ];
 
-  const res = await runWithTimeout(CLAUDE_BIN, args, {
+  const res = await runWithTimeout(claudeBin(), args, {
     cwd: opts.cwd,
     env: opts.env,
     timeoutSec,

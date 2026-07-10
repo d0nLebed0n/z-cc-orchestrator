@@ -7,11 +7,13 @@ import type { WorkerFn } from "./types.ts";
 import { runClaude } from "./runClaude.ts";
 import { runCodex } from "./runCodex.ts";
 import { runGlm } from "./runGlm.ts";
+import { runOllama } from "./runOllama.ts";
 
 export const WORKERS: Record<AgentName, WorkerFn> = {
   claude: runClaude,
   codex: runCodex,
   glm: runGlm,
+  ollama: runOllama,
 };
 
 export function getWorker(agent: AgentName): WorkerFn {
@@ -20,5 +22,5 @@ export function getWorker(agent: AgentName): WorkerFn {
   return w;
 }
 
-export { runClaude, runCodex, runGlm };
+export { runClaude, runCodex, runGlm, runOllama };
 export type { WorkerFn, WorkerResult, WorkerRunOptions } from "./types.ts";

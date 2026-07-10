@@ -13,6 +13,7 @@ import { mkdir, readFile, writeFile, readdir } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { randomUUID } from "node:crypto";
+import { Mutex } from "async-mutex";
 
 export const BLACKBOARD_DIR = ".orchestrator";
 const RESULTS_DIR = join(BLACKBOARD_DIR, "results");
@@ -88,6 +89,15 @@ async function writeState(state: BlackboardState, root = process.cwd()): Promise
   await writeFile(join(root, STATE_FILE), JSON.stringify(state, null, 2));
 }
 
+/**
+ * In-process мьютекс на запись state.json (review risk #1).
+ * createTask/updateTask/upsertStep делают read-modify-write; без сериализации
+ * параллельные runStep (Promise.all / runBounded) теряли StepRecord'ы
+ * (last-write-wins). Один мьютекс на процесс — state.json единственный.
+ * Межпроцессная гонка (два раннера) не покрывается — по дизайну один раннер на проект.
+ */
+const stateMutex = new Mutex();
+
 // ─── tasks ─────────────────────────────────────────────────────────────────
 
 export function newTaskId(): string {
@@ -105,23 +115,25 @@ export async function createTask(input: {
   root?: string;
 }): Promise<TaskRecord> {
   const root = input.root ?? process.cwd();
-  const state = await readState(root);
-  const now = new Date().toISOString();
-  const id = input.id ?? newTaskId();
-  const task: TaskRecord = {
-    id,
-    prompt: input.prompt,
-    workflow: input.workflow,
-    project: input.project,
-    status: input.status ?? "pending",
-    integration_branch: `orch/${id}/integration`,
-    created_at: now,
-    updated_at: now,
-    steps: input.steps ?? [],
-  };
-  state.tasks.push(task);
-  await writeState(state, root);
-  return task;
+  return stateMutex.runExclusive(async () => {
+    const state = await readState(root);
+    const now = new Date().toISOString();
+    const id = input.id ?? newTaskId();
+    const task: TaskRecord = {
+      id,
+      prompt: input.prompt,
+      workflow: input.workflow,
+      project: input.project,
+      status: input.status ?? "pending",
+      integration_branch: `orch/${id}/integration`,
+      created_at: now,
+      updated_at: now,
+      steps: input.steps ?? [],
+    };
+    state.tasks.push(task);
+    await writeState(state, root);
+    return task;
+  });
 }
 
 export async function getTask(taskId: string, root = process.cwd()): Promise<TaskRecord | null> {
@@ -139,23 +151,25 @@ export async function updateTask(
   patch: Partial<TaskRecord>,
   root = process.cwd(),
 ): Promise<TaskRecord> {
-  const state = await readState(root);
-  const idx = state.tasks.findIndex((t) => t.id === taskId);
-  if (idx === -1) throw new Error(`Task not found: ${taskId}`);
-  const existing = state.tasks[idx]!;
-  const updated: TaskRecord = {
-    ...existing,
-    ...patch,
-    id: existing.id, // immutable
-    created_at: existing.created_at, // immutable
-    prompt: patch.prompt ?? existing.prompt,
-    workflow: patch.workflow ?? existing.workflow,
-    project: patch.project ?? existing.project,
-    updated_at: new Date().toISOString(),
-  };
-  state.tasks[idx] = updated;
-  await writeState(state, root);
-  return updated;
+  return stateMutex.runExclusive(async () => {
+    const state = await readState(root);
+    const idx = state.tasks.findIndex((t) => t.id === taskId);
+    if (idx === -1) throw new Error(`Task not found: ${taskId}`);
+    const existing = state.tasks[idx]!;
+    const updated: TaskRecord = {
+      ...existing,
+      ...patch,
+      id: existing.id, // immutable
+      created_at: existing.created_at, // immutable
+      prompt: patch.prompt ?? existing.prompt,
+      workflow: patch.workflow ?? existing.workflow,
+      project: patch.project ?? existing.project,
+      updated_at: new Date().toISOString(),
+    };
+    state.tasks[idx] = updated;
+    await writeState(state, root);
+    return updated;
+  });
 }
 
 // ─── steps ─────────────────────────────────────────────────────────────────
@@ -165,14 +179,16 @@ export async function upsertStep(
   step: StepRecord,
   root = process.cwd(),
 ): Promise<void> {
-  const state = await readState(root);
-  const task = state.tasks.find((t) => t.id === taskId);
-  if (!task) throw new Error(`Task not found: ${taskId}`);
-  const idx = task.steps.findIndex((s) => s.id === step.id);
-  if (idx === -1) task.steps.push(step);
-  else task.steps[idx] = step;
-  task.updated_at = new Date().toISOString();
-  await writeState(state, root);
+  await stateMutex.runExclusive(async () => {
+    const state = await readState(root);
+    const task = state.tasks.find((t) => t.id === taskId);
+    if (!task) throw new Error(`Task not found: ${taskId}`);
+    const idx = task.steps.findIndex((s) => s.id === step.id);
+    if (idx === -1) task.steps.push(step);
+    else task.steps[idx] = step;
+    task.updated_at = new Date().toISOString();
+    await writeState(state, root);
+  });
 }
 
 export function newStepId(taskId: string, n: number, iteration = 1): string {
@@ -180,6 +196,41 @@ export function newStepId(taskId: string, n: number, iteration = 1): string {
   // друг друга в results/ и state.json.
   const base = `${taskId}-S${String(n).padStart(2, "0")}`;
   return iteration > 1 ? `${base}#${iteration}` : base;
+}
+
+/** Fan-out подзадача: суффикс ~<subtaskId>, review добавляет r. Сегмент `~`, не `#` (# = итерация цикла). */
+export function newSubtaskStepId(baseStepId: string, subtaskId: string, isReview = false): string {
+  return `${baseStepId}~${subtaskId}${isReview ? "r" : ""}`;
+}
+
+/** Разобрать stepId на сегменты: <base>[#<iteration>][~<subtask>[r]]. */
+export interface StepSegments {
+  base: string;
+  iteration: number | null;
+  subtask: string | null;
+  isReview: boolean;
+}
+export function parseStepSegments(stepId: string): StepSegments {
+  const tildeIdx = stepId.indexOf("~");
+  const hashIdx = stepId.indexOf("#");
+  const base = stepId.slice(0, Math.min(
+    tildeIdx === -1 ? stepId.length : tildeIdx,
+    hashIdx === -1 ? stepId.length : hashIdx,
+  ));
+  let iteration: number | null = null;
+  let subtask: string | null = null;
+  let isReview = false;
+  if (hashIdx !== -1) {
+    const after = stepId.slice(hashIdx + 1, tildeIdx === -1 ? stepId.length : tildeIdx);
+    iteration = Number.parseInt(after, 10);
+    if (Number.isNaN(iteration)) iteration = null;
+  }
+  if (tildeIdx !== -1) {
+    let after = stepId.slice(tildeIdx + 1);
+    if (after.endsWith("r")) { isReview = true; after = after.slice(0, -1); }
+    subtask = after || null;
+  }
+  return { base, iteration, subtask, isReview };
 }
 
 // ─── results / checkpoints / log ───────────────────────────────────────────

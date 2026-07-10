@@ -5,6 +5,10 @@
 import { AGENTS, pickReviewer, validReviewerFamilies } from "../src/families.ts";
 import { makeEnvelope, validateEnvelope } from "../src/envelope.ts";
 import { consumeBudget, newBudgetState, CircuitBreaker } from "../src/resilience.ts";
+import { createTask, upsertStep, getTask, initBlackboard } from "../src/blackboard.ts";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 function assert(cond: boolean, msg: string): void {
   if (!cond) {
@@ -14,7 +18,7 @@ function assert(cond: boolean, msg: string): void {
   console.log("✓ " + msg);
 }
 
-function main(): void {
+async function main(): Promise<void> {
   // Семьи
   assert(AGENTS.claude.family === "anthropic", "claude → anthropic");
   assert(AGENTS.codex.family === "openai", "codex → openai");
@@ -53,6 +57,21 @@ function main(): void {
   validateEnvelope(env);
   console.log("✓ validateEnvelope(glm) ok");
 
+  // local / ollama
+  assert(AGENTS.ollama.family === "local", "ollama → local");
+  assert(!validReviewerFamilies("anthropic").includes("local"), "local is NOT a reviewer for anthropic");
+  assert(!validReviewerFamilies("openai").includes("local"), "local is NOT a reviewer for openai");
+  assert(validReviewerFamilies("local").includes("anthropic"), "local code → anthropic can review");
+  assert(!validReviewerFamilies("local").includes("local"), "local cannot self-review");
+
+  const ollamaEnv = makeEnvelope({
+    id: "T-OLLAMA", agent: "ollama", role: "implement", prompt: "x",
+    target_paths: ["src/a.ts"], context: null,
+    budget: { wall_time_sec: 600, max_steps: 2 }, effort: "low",
+  });
+  assert(ollamaEnv.family === "local", "envelope.ollama → family local");
+  validateEnvelope(ollamaEnv);
+
   // Envelope family mismatch → throws
   try {
     makeEnvelope({
@@ -90,7 +109,33 @@ function main(): void {
   cb.recordSuccess("codex");
   assert(!cb.isTripped("codex"), "breaker: reset after success");
 
+  // ── state.json race (review risk #1): 50 параллельных upsertStep ──
+  // До мьютекса last-write-wins терял бы записи. Теперь все 50 должны сохраниться.
+  const raceRoot = mkdtempSync(join(tmpdir(), "orch-race-"));
+  await initBlackboard(raceRoot);
+  const task = await createTask({
+    prompt: "race test", workflow: "x", project: raceRoot, root: raceRoot,
+  });
+  const N = 50;
+  const steps = Array.from({ length: N }, (_, i) => ({
+    id: `${task.id}-S${String(i + 1).padStart(2, "0")}`,
+    task_id: task.id,
+    agent: "ollama", family: "local", role: "implement",
+    status: "success" as const,
+    started_at: null, finished_at: null, attempts: 1,
+    result_path: null, error: null,
+  }));
+  await Promise.all(steps.map((s) => upsertStep(task.id, s, raceRoot)));
+  const after = await getTask(task.id, raceRoot);
+  assert(after!.steps.length === N, `race: all ${N} steps persisted (got ${after!.steps.length})`);
+  const ids = new Set(after!.steps.map((s) => s.id));
+  assert(steps.every((s) => ids.has(s.id)), "race: no step lost (all ids present)");
+  rmSync(raceRoot, { recursive: true, force: true });
+
   console.log("\nAll unit checks passed.");
 }
 
-main();
+main().catch((e) => {
+  console.error(e instanceof Error ? e.message : String(e));
+  process.exit(1);
+});

@@ -25,9 +25,12 @@ import { runWithTimeout, truncate } from "./spawn.ts";
 
 const execFileAsync = promisify(execFile);
 
-// macOS Codex.app не в PATH по умолчанию — fallback на полный путь.
-const CODEX_BIN =
-  process.env.CODEX_BIN ?? "/Applications/Codex.app/Contents/Resources/codex";
+// Codex CLI: OpenAI влил standalone Codex.app в ChatGPT.app (версия 0.144.0+).
+// Старый путь /Applications/Codex.app/.../codex больше не существует.
+// Runtime-геттер (review #2): env читается при вызове, не при импорте (ESM
+// imports в cli.ts идут до loadEnv). Переопределяется env CODEX_BIN.
+const codexBin = (): string =>
+  process.env.CODEX_BIN ?? "/Applications/ChatGPT.app/Contents/Resources/codex";
 
 async function gitHasChanges(cwd: string): Promise<boolean> {
   try {
@@ -39,8 +42,10 @@ async function gitHasChanges(cwd: string): Promise<boolean> {
 }
 
 export const runCodex: WorkerFn = async (envelope, opts) => {
+  // review #3: на ретраях раннер передаёт остаток бюджета шага.
+  const wallSec = opts.wallTimeSecOverride ?? envelope.budget.wall_time_sec;
   const timeoutSec = Math.min(
-    envelope.budget.wall_time_sec,
+    wallSec,
     (envelope.budget.max_session_min ?? 25) * 60,
   );
 
@@ -68,7 +73,7 @@ export const runCodex: WorkerFn = async (envelope, opts) => {
     envelope.prompt,
   ];
 
-  const res = await runWithTimeout(CODEX_BIN, args, {
+  const res = await runWithTimeout(codexBin(), args, {
     cwd: opts.cwd,
     env: opts.env,
     timeoutSec,

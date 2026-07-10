@@ -3,6 +3,8 @@ node_modules/
 
 # build
 dist/
+docs/
+.next/
 
 # runtime blackboard (§4)
 .orchestrator/

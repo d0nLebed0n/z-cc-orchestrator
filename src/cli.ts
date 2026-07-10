@@ -38,12 +38,17 @@ function usage(): string {
     "  ai-task --accept <task-id>     accept task: merge integration → main",
     "",
     "OPTIONS:",
-    "  --workflow <name>   workflow yaml in workflows/ (default: default)",
-    "  --project <path>    target repo (default: cwd)",
+    "  --workflow <name>      workflow yaml in workflows/ (default: default)",
+    "  --project <path>       target repo (default: cwd)",
+    "  --max-parallel <n>     cap parallel workers (default: workflow max_parallel or 3)",
     "",
     "ENV (for GLM steps):",
     "  GLM_BASE_URL        Z.ai anthropic-compatible endpoint",
     "  GLM_API_KEY         Z.ai API key",
+    "",
+    "ENV (for Ollama/local steps — read from process.env by the worker):",
+    "  OLLAMA_BASE_URL     Ollama OpenAI-compat endpoint",
+    "  OLLAMA_MODEL        model id (e.g. danielsheep/Qwen3-Coder-30B-A3B-Instruct-1M-Unsloth:UD-IQ3_XXS)",
   ].join("\n");
 }
 
@@ -85,6 +90,7 @@ async function main(): Promise<void> {
     options: {
       workflow: { type: "string", short: "w" },
       project: { type: "string", short: "p" },
+      "max-parallel": { type: "string" },
       list: { type: "boolean", default: false },
       status: { type: "boolean", default: false },
       health: { type: "boolean", default: false },
@@ -112,7 +118,10 @@ async function main(): Promise<void> {
     const glmEnv: Record<string, string> = {};
     if (process.env.GLM_BASE_URL) glmEnv.ANTHROPIC_BASE_URL = process.env.GLM_BASE_URL;
     if (process.env.GLM_API_KEY) glmEnv.ANTHROPIC_API_KEY = process.env.GLM_API_KEY;
+    // ollama читает OLLAMA_BASE_URL/OLLAMA_MODEL напрямую из process.env (dotenv
+    // уже выставил их из .env.local). Если base url задан — добавляем в список.
     const agents: AgentName[] = ["claude", "codex", "glm"];
+    if (process.env.OLLAMA_BASE_URL) agents.push("ollama");
     console.log("Checking health of all agents...\n");
     const results = await checkHealthForAgents(agents, Object.keys(glmEnv).length > 0 ? glmEnv : undefined);
     console.log(formatHealthReport(results));
@@ -158,6 +167,21 @@ async function main(): Promise<void> {
   if (process.env.GLM_BASE_URL) glmEnv.ANTHROPIC_BASE_URL = process.env.GLM_BASE_URL;
   if (process.env.GLM_API_KEY) glmEnv.ANTHROPIC_API_KEY = process.env.GLM_API_KEY;
 
+  // ollama env: runOllama/checkOllama читают process.env напрямую (dotenv уже
+  // выставил их из .env.local), но раннеру нужен объект для health-gate и
+  // логирования — собираем из тех же значений.
+  const ollamaEnv: Record<string, string> = {};
+  if (process.env.OLLAMA_BASE_URL) ollamaEnv.OLLAMA_BASE_URL = process.env.OLLAMA_BASE_URL;
+  if (process.env.OLLAMA_MODEL) ollamaEnv.OLLAMA_MODEL = process.env.OLLAMA_MODEL;
+
+  // max-parallel: CLI флаг > воркфлоу max_parallel > 3 (раннер разрешает финал).
+  const maxParallelRaw = typeof values["max-parallel"] === "string" ? values["max-parallel"] : undefined;
+  const maxParallel = maxParallelRaw ? Number.parseInt(maxParallelRaw, 10) : undefined;
+  if (maxParallelRaw !== undefined && (!maxParallel || !Number.isFinite(maxParallel) || maxParallel < 1)) {
+    console.error(`Invalid --max-parallel value: '${maxParallelRaw}' (must be a positive integer)`);
+    process.exit(1);
+  }
+
   console.log(`▶ workflow: ${workflowName}`);
   console.log(`▶ project:  ${project}`);
   console.log(`▶ prompt:   ${prompt.slice(0, 100)}${prompt.length > 100 ? "…" : ""}`);
@@ -168,6 +192,8 @@ async function main(): Promise<void> {
     prompt,
     project,
     glmEnv: Object.keys(glmEnv).length > 0 ? glmEnv : undefined,
+    ollamaEnv: Object.keys(ollamaEnv).length > 0 ? ollamaEnv : undefined,
+    maxParallel,
   });
 
   if (result.success) {
