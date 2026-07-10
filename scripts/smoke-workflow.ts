@@ -20,6 +20,8 @@ assert(pathsOverlap(["src"], ["src/foo.ts"]), "src overlaps src/foo.ts");
 assert(pathsOverlap(["src/foo.ts"], ["src/./foo.ts"]), "normalized same path overlaps");
 assert(!pathsOverlap(["src/a.ts"], ["src/b.ts"]), "distinct files don't overlap");
 assert(!pathsOverlap(["src"], ["test"]), "distinct dirs don't overlap");
+assert(pathsOverlap(["a/b/../c.ts"], ["a/c.ts"]), "normalize collapses .. (a/b/../c.ts == a/c.ts)");
+assert(pathsOverlap(["src/./sub/../x.ts"], ["src/x.ts"]), "normalize collapses ./ and ../ mixed");
 
 // fan_out compiles
 const wf = WorkflowSchema.parse({

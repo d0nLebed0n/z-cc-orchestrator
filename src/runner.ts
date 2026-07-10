@@ -901,7 +901,12 @@ export async function runWorkflow(opts: RunOptions): Promise<RunResult> {
       const exitStepId = newStepId(task.id, exitStepIdx + 1, iteration);
       const verdict = await parseVerdict(task.id, exitStepId);
       await logEvent({
-        task_id: task.id, step_id: exitStepId, level: "info", kind: "loop_verdict",
+        task_id: task.id, step_id: exitStepId,
+        // null-вердикт = промпт ревьюера съехал, VERDICT: не распарсился.
+        // Трактуется безопасно (REQUEST_CHANGES), но логируем как warn — loud failure
+        // > quiet success (review #6).
+        level: verdict === null ? "warn" : "info",
+        kind: "loop_verdict",
         message: `iteration ${iteration}/${loop.max_iterations}: verdict=${verdict ?? "(unparsed)"}`,
       });
       if (verdict === "APPROVE" || verdict === "ACCEPT") {

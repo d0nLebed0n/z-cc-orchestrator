@@ -6,6 +6,7 @@
  * выхода по вердикту review-шага).
  */
 import { z } from "zod";
+import { posix } from "node:path";
 import { AGENTS, type AgentName, type Family } from "./families.ts";
 import type { Subtask } from "./plan.ts";
 
@@ -228,9 +229,17 @@ export function orderLoopBody(steps: ResolvedStep[]): ResolvedStep[] {
   return ordered;
 }
 
-/** Нормализовать путь: убрать ./ и повторные слэши, без leading ./ */
+/**
+ * Нормализовать путь для сравнения target_paths (review #11).
+ * backslash→slash (Windows-пути в YAML), затем posix.normalize коллапсит
+ * ./, // и ../ (a/b/../c → a/c). Старый regex-only norm не видел ../,
+ * из-за чего pathsOverlap пропускал реальное пересечение.
+ */
 function norm(p: string): string {
-  return p.replace(/\\/g, "/").replace(/\/+/g, "/").replace(/^\.\//, "").replace(/\/\.\//g, "/");
+  const slashed = p.replace(/\\/g, "/");
+  const normalized = posix.normalize(slashed);
+  // normalize оставляет trailing /. для пустого/корня — убираем.
+  return normalized.replace(/\/$/, "") || normalized;
 }
 
 /** Пересекаются ли две области target_paths? parent/child считается пересечением. */

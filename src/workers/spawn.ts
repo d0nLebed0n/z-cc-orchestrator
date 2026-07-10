@@ -36,8 +36,22 @@ export function runWithTimeout(
       cwd: opts.cwd,
       env,
       stdio: ["ignore", "pipe", "pipe"],
-      // не наследовать tty — headless
+      // detached: новая process group (setsid) — child.pid = лидер группы.
+      // Позволяет убить ВСЮ группу при таймауте, включая внуков (claude/codex
+      // спавнят дочерние процессы, которые иначе переживут SIGKILL head-процесса).
+      // review #5.
+      detached: true,
     });
+
+    /** Убить всю process group (-pid). Безопасно: ESRCH если группа уже мертва. */
+    const killGroup = (sig: NodeJS.Signals): void => {
+      if (child.pid == null) return;
+      try {
+        process.kill(-child.pid, sig);
+      } catch {
+        // ESRCH — группа уже завершилась; не ошибка.
+      }
+    };
 
     let stdout = "";
     let stderr = "";
@@ -53,9 +67,9 @@ export function runWithTimeout(
 
     const timer = setTimeout(() => {
       killed = true;
-      child.kill("SIGTERM");
-      // Если за 5 сек не умер — добиваем.
-      setTimeout(() => child.kill("SIGKILL"), 5000);
+      killGroup("SIGTERM");
+      // Если за 5 сек группа не умерла — добиваем всю группу.
+      setTimeout(() => killGroup("SIGKILL"), 5000);
     }, opts.timeoutSec * 1000);
 
     child.on("error", (err) => {
