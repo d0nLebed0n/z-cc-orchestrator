@@ -683,30 +683,24 @@ async function runFanOut(
       summaries.push(`- ${item.subtask.id}: FAILED (candidate merge conflict)`);
       continue;
     }
-    // diff guard (point #12): правки только в target_paths подзадачи.
-    // Сравниваем candidate с integration (откуда он создан) — это diff implement-ветки.
+    // diff guard (point #12) — ослаблен: правки вне target_paths логируем как
+    // warn, но НЕ блокируем. Реальные бэкенд-задачи неминуемо выходят за область
+    // (любой новый модуль требует правки app.module.ts). Phase B merge-first
+    // ловит ФАКТИЧЕСКИЕ конфликты при merge в candidate — этого достаточно.
     const { stdout: names } = await git(candidate.worktreePath, ["diff", "--name-only", integrationBranch(taskId), candidate.branch])
       .catch(() => ({ stdout: "" }));
     const changed = names.trim().split("\n").filter(Boolean);
-    // S3 (Codex review): используем pathsOverlap (нормализация + parent/child),
-    // не raw-сравнение — иначе ./src/a.ts vs src/a.ts классифицируются непоследовательно.
-    const outOfScope = changed.filter((f) => {
-      const tp = item.subtask.target_paths;
-      if (tp.length === 0) return false; // нет target_paths → не ограничиваем
-      return !pathsOverlap([f], tp);
-    });
-    if (outOfScope.length > 0) {
-      await escalateHitl({
-        task_id: taskId, step_id: null,
-        reason: `fan_out: subtask ${item.subtask.id} diff out of target_paths`,
-        detail: { outOfScope, target_paths: item.subtask.target_paths },
-      });
-      await discardCandidate(projectPath, candidate);
-      await removeWorktree(projectPath, item.wt);
-      failed.push(item.subtask.id);
-      allApproved = false;
-      summaries.push(`- ${item.subtask.id}: FAILED (diff out of scope)`);
-      continue;
+    const tp = item.subtask.target_paths;
+    if (tp.length > 0) {
+      const outOfScope = changed.filter((f) => !pathsOverlap([f], tp));
+      if (outOfScope.length > 0) {
+        await logEvent({
+          task_id: taskId, step_id: null, level: "warn",
+          kind: "fanout_diff_out_of_scope",
+          message: `subtask ${item.subtask.id} changed files outside target_paths (allowed — merge-first will catch real conflicts)`,
+          data: { outOfScope, target_paths: tp },
+        });
+      }
     }
     // codex-review в candidate-worktree (видит смерженный код). skipWorktree + cwdOverride,
     // чтобы runWorkerOnly не создавал собственный worktree — ревьюер работает в candidate.
