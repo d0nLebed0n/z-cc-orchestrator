@@ -56,7 +56,10 @@ export type Loop = z.infer<typeof LoopSchema>;
 export const WorkflowSchema = z.object({
   name: z.string().min(1),
   description: z.string().default(""),
-  complexity_threshold: z.number().int().min(0).max(100).default(80),
+  // default 50: Claude оценивает сложность относительно всей задачи, поэтому
+  // отдельным модулям достаётся 40-60. Порог 50 пускает в ollama только
+  // простейшее (boilerplate), сложную интеграцию/тесты забирает glm.
+  complexity_threshold: z.number().int().min(0).max(100).default(50),
   max_parallel: z.number().int().positive().default(3),
   /** Линейные шаги ДО цикла (DAG). Могут быть пустым массивом. */
   steps: z.array(WorkflowStepSchema).default([]),

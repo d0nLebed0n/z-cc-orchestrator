@@ -2,7 +2,11 @@ name: decomposed
 description: |
   Claude декомпозирует → fan-out на glm (сложное) + ollama (простое),
   каждая подзадача независимо ревьётся codex.
-complexity_threshold: 80
+# complexity < threshold → ollama (тривиальное), >= threshold → glm (сложное).
+# 50: Claude оценивает сложность относительно всей задачи, поэтому отдельным
+# модулям достаётся 40-60. Порог 50 пускает в ollama только простейшее
+# (boilerplate, изолированные функции), сложную интеграцию/тесты забирает glm.
+complexity_threshold: 50
 max_parallel: 3
 
 steps:
