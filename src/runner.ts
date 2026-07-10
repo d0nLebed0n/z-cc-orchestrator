@@ -29,6 +29,7 @@ import {
   readResult,
   logEvent,
   newStepId,
+  getTask,
   type StepRecord,
   type TaskRecord,
 } from "./blackboard.ts";
@@ -775,6 +776,71 @@ function buildReviewPrompt(subtask: Subtask): string {
   ].join("\n");
 }
 
+/**
+ * Graceful shutdown при внешнем SIGTERM/SIGINT (напр. UI "Остановить",
+ * таймаут Bash, Ctrl+C). Без этого процесс умирает, а задача остаётся в
+ * `running` навсегда (runWorkerOnly не дописывает статус шага).
+ *
+ * Регистрируем ОДИН обработчик после createTask; при сигнале:
+ *  - помечаем висящие running-шаги → failed
+ *  - задача → failed
+ *  - cleanup integration worktree (если уже создан)
+ *  - логируем причину
+ *  - выходим (не блокируем сигнал — позволяем процессу умереть)
+ *
+ * handleRef возвращает функцию снятия регистрации (для нормального пути).
+ */
+export function installShutdownHandler(
+  taskId: string,
+  projectPath: string,
+  integrationRef: { value: { branch: string; worktreePath: string } | null },
+): () => void {
+  const handler = async (sig: NodeJS.Signals) => {
+    // Предотвращаем повторный вход (второй SIGKILL всё равно добьёт).
+    process.removeAllListeners(sig);
+    console.error(`\n⚠ received ${sig} — graceful shutdown of task ${taskId}`);
+    try {
+      // 1. Помечаем висящие running-шаги → failed.
+      const task = await getTask(taskId);
+      if (task) {
+        let changed = false;
+        for (const st of task.steps) {
+          if (st.status === "running") {
+            st.status = "failed";
+            st.finished_at = new Date().toISOString();
+            st.error = `interrupted by ${sig}`;
+            changed = true;
+          }
+        }
+        if (changed) {
+          await updateTask(taskId, { status: "failed", steps: task.steps });
+        } else {
+          await updateTask(taskId, { status: "failed" });
+        }
+        await logEvent({
+          task_id: taskId, step_id: null, level: "error",
+          kind: "graceful_shutdown", message: `task interrupted by ${sig}; marked failed`,
+          data: { interrupted_steps: task.steps.filter((s) => s.error === `interrupted by ${sig}`).map((s) => s.id) },
+        });
+      }
+      // 2. Cleanup integration worktree (ветку оставляем для разбора).
+      if (integrationRef.value) {
+        await removeIntegrationWorktree(projectPath, integrationRef.value.worktreePath).catch(() => {});
+      }
+    } catch (e) {
+      // Даже если не успели записать — не блокируем выход.
+      console.error(`  (shutdown cleanup failed: ${e instanceof Error ? e.message : e})`);
+    }
+    process.exit(130); // 128+SIGINT по конвенции; подойдёт и для SIGTERM.
+  };
+  process.on("SIGTERM", handler);
+  process.on("SIGINT", handler);
+  return () => {
+    process.off("SIGTERM", handler);
+    process.off("SIGINT", handler);
+  };
+}
+
 /** Точка входа раннера: запустить воркфлоу над проектом. */
 export async function runWorkflow(opts: RunOptions): Promise<RunResult> {
   const loaded = await loadWorkflow(opts.workflowPath);
@@ -832,10 +898,17 @@ export async function runWorkflow(opts: RunOptions): Promise<RunResult> {
   // Оборачиваем тело в try/catch: при ЛЮБОЙ необработанной ошибке (напр.
   // git-падение в setupIntegration/merge) ставить задаче status=failed и
   // логировать, а не бросать наружу — иначе задача висит в running навсегда.
+  // integrationRef — обёртка, чтобы shutdown-handler видел актуальное значение
+  // integration (let-переменная не видна в замыкании после reassign).
+  const integrationRef: { value: { branch: string; worktreePath: string } | null } = { value: null };
+  // Graceful shutdown: при внешнем SIGTERM/SIGINT (UI stop, таймаут, Ctrl+C)
+  // помечаем задачу failed и чистим worktree — иначе зависает в running.
+  const removeShutdownHandler = installShutdownHandler(task.id, projectPath, integrationRef);
   let integration: { branch: string; worktreePath: string } | null = null;
   try {
     // Integration живёт в собственном worktree — НЕ трогает HEAD основного репо.
     integration = await setupIntegration(projectPath, task.id);
+    integrationRef.value = integration;
     const integrationWtPath = integration.worktreePath;
 
   const breaker = new CircuitBreaker(3);
@@ -1024,5 +1097,10 @@ export async function runWorkflow(opts: RunOptions): Promise<RunResult> {
     }
     // ^ integration.worktreePath безопасен здесь: внутри if (integration) — TS сужает.
     throw err; // пере-бросаем: CLI покажет ошибку пользователю.
+  } finally {
+    // Нормальный выход — снимаем shutdown-handler, чтобы он не сработал
+    // на последующих задачах (если раннер переиспользуется в одном процессе).
+    removeShutdownHandler();
+    integrationRef.value = null;
   }
 }
