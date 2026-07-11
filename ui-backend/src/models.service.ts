@@ -126,17 +126,52 @@ export class ModelsService {
     await writeFileAsync(PATHS.secretsFile, lines.join("\n") + "\n", "utf8");
   }
 
+  /**
+   * Резолвит путь к бинарнику claude/codex консистентно с движком (health.ts):
+   *   1. env CLAUDE_BIN / CODEX_BIN (явный override)
+   *   2. стандартные macOS .app пути (Claude/Codex CLI ставятся в /Applications)
+   *   3. which <name> — фолбэк (сработает только если бинарник в PATH без алиаса)
+   * `which` в не-интерактивном шелле НЕ видит zsh-алиасов из .zshrc, поэтому
+   * без шагов 1-2 codex на macOS с .app-установкой не находится.
+   */
+  private async resolveBinaryPath(
+    name: "claude" | "codex",
+  ): Promise<{ found: boolean; path?: string }> {
+    // 1. env override
+    const envVar = name === "claude" ? "CLAUDE_BIN" : "CODEX_BIN";
+    if (process.env[envVar]) {
+      const p = process.env[envVar]!;
+      if (existsSync(p)) return { found: true, path: p };
+    }
+    // 2. стандартные .app пути (macOS)
+    const appPaths =
+      name === "claude"
+        ? ["/Applications/Claude.app/Contents/Resources/claude"]
+        : [
+            "/Applications/ChatGPT.app/Contents/Resources/codex", // OpenAI merged standalone
+            "/Applications/Codex.app/Contents/Resources/codex",
+          ];
+    for (const p of appPaths) {
+      if (existsSync(p)) return { found: true, path: p };
+    }
+    // 3. which (фолбэк — PATH без алиасов)
+    try {
+      const { stdout } = await execFileAsync("which", [name]);
+      const p = stdout.trim();
+      if (p) return { found: true, path: p };
+    } catch {
+      // не в PATH
+    }
+    return { found: false };
+  }
+
   private async statusOf(model: StoredModel): Promise<ModelDto["status"]> {
     if (model.kind === "claude-binary" || model.kind === "codex-binary") {
-      const bin = model.kind === "claude-binary" ? "claude" : "codex";
-      try {
-        await execFileAsync("which", [bin]);
-        return "ready";
-      } catch {
-        return "not_found";
-      }
+      const name = model.kind === "claude-binary" ? "claude" : "codex";
+      const { found } = await this.resolveBinaryPath(name);
+      return found ? "ready" : "not_found";
     }
-    // Для api/ollama-http статус "unknown" — реальная проверка при запуске задачи.
+    // Для api/ollama-http реальная проверка — при запуске задачи.
     return "ready";
   }
 
@@ -206,21 +241,17 @@ export class ModelsService {
     path?: string;
     version?: string;
   }> {
-    const bin = kind === "claude-binary" ? "claude" : "codex";
+    const name = kind === "claude-binary" ? "claude" : "codex";
+    const { found, path } = await this.resolveBinaryPath(name);
+    if (!found || !path) return { found: false };
+    let version: string | undefined;
     try {
-      const { stdout } = await execFileAsync("which", [bin]);
-      const path = stdout.trim();
-      let version: string | undefined;
-      try {
-        const v = await execFileAsync(bin, ["--version"]);
-        version = v.stdout.trim().split("\n")[0];
-      } catch {
-        // version optional
-      }
-      return { found: true, path, version };
+      const v = await execFileAsync(path, ["--version"]);
+      version = v.stdout.trim().split("\n")[0];
     } catch {
-      return { found: false };
+      // version optional
     }
+    return { found: true, path, version };
   }
 
   async updateRoles(dto: UpdateRolesDto): Promise<void> {
