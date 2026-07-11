@@ -5,6 +5,7 @@ import {
   ConflictException,
   Get,
   HttpCode,
+  Inject,
   NotFoundException,
   Param,
   Post,
@@ -33,9 +34,10 @@ interface StartBody {
  */
 @Controller("processes")
 export class ProcessesController {
+  // @Inject явно: tsx (esbuild) не эмитит decorator metadata.
   constructor(
-    private readonly manager: ProcessManager,
-    private readonly reader: BlackboardReader,
+    @Inject(ProcessManager) private readonly manager: ProcessManager,
+    @Inject(BlackboardReader) private readonly reader: BlackboardReader,
   ) {}
 
   @Post()

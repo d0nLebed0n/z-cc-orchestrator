@@ -4,6 +4,7 @@ import {
   ConflictException,
   Get,
   HttpCode,
+  Inject,
   NotFoundException,
   Param,
   Post,
@@ -18,9 +19,10 @@ import { ProcessManager } from "./process-manager.service";
  */
 @Controller("tasks")
 export class TasksController {
+  // @Inject явно: tsx (esbuild) не эмитит decorator metadata.
   constructor(
-    private readonly reader: BlackboardReader,
-    private readonly manager: ProcessManager,
+    @Inject(BlackboardReader) private readonly reader: BlackboardReader,
+    @Inject(ProcessManager) private readonly manager: ProcessManager,
   ) {}
 
   @Get()

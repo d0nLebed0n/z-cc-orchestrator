@@ -7,6 +7,7 @@ import {
   Body,
   Param,
   Query,
+  Inject,
   BadRequestException,
   NotFoundException,
   InternalServerErrorException,
@@ -16,7 +17,8 @@ import type { ModelInputDto, UpdateRolesDto } from "./models.dto";
 
 @Controller("models")
 export class ModelsController {
-  constructor(private readonly models: ModelsService) {}
+  // @Inject явно: tsx (esbuild) не эмитит decorator metadata.
+  constructor(@Inject(ModelsService) private readonly models: ModelsService) {}
 
   @Get()
   async list() {

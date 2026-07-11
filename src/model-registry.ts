@@ -1,5 +1,5 @@
-import { readFileSync, writeFileSync, existsSync } from "node:fs";
-import { join } from "node:path";
+import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
+import { join, dirname } from "node:path";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import {
   ModelsConfigSchema,
@@ -60,6 +60,7 @@ export function loadModelsConfig(dir: string): ModelsConfig {
     // Миграция: добавить роль architect, если её нет (новая роль с этого коммита).
     if (!cached.roles.architect) {
       cached.roles.architect = "claude";
+      mkdirSync(dirname(modelsPath), { recursive: true });
       writeFileSync(modelsPath, stringifyYaml(cached), "utf8");
     }
   } else {
@@ -70,6 +71,8 @@ export function loadModelsConfig(dir: string): ModelsConfig {
       const glmModel = cached.models.find((m) => m.id === "glm");
       if (glmModel) glmModel.base_url = process.env.GLM_BASE_URL;
     }
+    // .orchestrator/ может не существовать в чужом проекте — создаём.
+    mkdirSync(dirname(modelsPath), { recursive: true });
     writeFileSync(modelsPath, stringifyYaml(cached), "utf8");
     modelsSeeded = true;
   }
