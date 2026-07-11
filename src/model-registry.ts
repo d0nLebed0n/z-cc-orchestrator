@@ -56,7 +56,7 @@ export function loadModelsConfig(dir: string): ModelsConfig {
     const parsed = ModelsConfigSchema.parse(parseYaml(raw));
     cached = parsed;
   } else {
-    cached = DEFAULT_CONFIG;
+    cached = structuredClone(DEFAULT_CONFIG);
     writeFileSync(modelsPath, stringifyYaml(DEFAULT_CONFIG), "utf8");
   }
   // Секреты: читаем всегда (могут измениться).
