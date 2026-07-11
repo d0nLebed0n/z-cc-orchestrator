@@ -32,7 +32,7 @@ z-cc-orchestrator — оркестратор для AI-CLI воркеров (cla
 | Наполнение `05-context/` | Пользователь вручную; деградация нормальна |
 | Инъекция | В оркестраторе через `buildWorkerPrompt` (для всех моделей) |
 | Триггер создания | UI-кнопка «Открыть проект» в RunForm |
-| Обновление | Авто-логи после задачи, `00-project` immutable |
+| Обновление | Авто-логи после задачи; `00-project` не обновляется автоматически |
 | Архитектурный подход | Минимально-инвазивный (новый модуль + 1 параметр в `buildWorkerPrompt`) |
 
 ---
@@ -74,7 +74,7 @@ src/project-knowledge/
 ### 3.4. Что НЕ трогает
 - `runner.ts`, `workflow.ts`, `blackboard.ts` — без изменений в их ядре (только расширение `runWorkflow` пробросом slug/ctxCache/activeTask).
 - `dispatchWorker` — без изменений (инъекция происходит ДО него, в промпте).
-- `.orchestrator/models.yaml`, `.orchestrator/state.json` — без изменений (только добавляется роль `architect` в role map).
+- `.orchestrator/state.json` — без изменений. `.orchestrator/models.yaml` и Settings-типы расширяются новой ролью `architect`.
 
 ### 3.5. Соответствие существующим паттернам
 - JSON-файл-реестр + директория с данными = паттерн `blackboard.ts` (state.json + results/).
@@ -91,22 +91,43 @@ src/project-knowledge/
 - **Не существует** → создаётся скелет (все 8 секций с заглушками из `templates/`) + запускается **architect-фаза** для наполнения `00-project/`. `status: generating` → `ready`.
 
 ### 4.2. Workflow `workflows/project-init.yaml` (новый)
-Линейный workflow без fan-out, один шаг:
+Линейный workflow без fan-out, один шаг. Формат должен соответствовать текущей `WorkflowSchema` (`steps`, объект `budget`), а не старому `levels`-формату:
 ```yaml
 name: project-init
-levels:
-  - - id: discover
-      role: architect
-      agent: claude          # из role map
-      budget: 5
+description: Generate project knowledge 00-project files
+steps:
+  - id: discover
+    role: architect
+    # Вариант A: оставить agent явным для совместимости с текущей проверкой
+    # "non-fan_out steps require an agent".
+    agent: claude
+    effort: high
+    budget:
+      wall_time_sec: 300
+      max_steps: 1
+      max_session_min: 5
 ```
 
+Проверка `non-fan_out steps require an agent` — это `.refine` на всей `WorkflowSchema` (`workflow.ts:110`), а не локальное правило для одного workflow. Её ослабление затронуло бы **все** воркфлоу разом, поэтому в этом цикле **не трогаем**: `agent: claude` в `project-init.yaml` остаётся обязательным (Вариант A). Разрешение брать модель из role map для non-fan_out шагов (Вариант B) — отдельная задача вне scope.
+
+Примечание: при этом фактический исполнитель всё равно резолвится через `roleMap[s.role] ?? "claude"` (`workflow.ts:144`) как fallback, но `s.agent` должен быть задан, чтобы пройти валидацию. Держим `agent: claude` явно.
+
 ### 4.3. Роль `architect` — новая 7-я роль
-Добавляется в `Role` union (`src/envelope.ts`) и `ROLE_PROMPTS` (`roles.ts:284`).
+Добавляется в `Role` union (`src/envelope.ts`), `ROLE_PROMPTS` (`roles.ts:284`), `WorkflowStepSchema.role`, model config schemas, дефолтный role map и UI SettingsRoles.
+
+Список мест, где 6 ролей становятся 7 ролями:
+- `src/envelope.ts:13`: `RoleSchema` (`z.enum`) + производный тип `Role`.
+- `src/workflow.ts:19`: `WorkflowStepSchema.role` — **⚠️ это отдельный inline `z.enum([...6 ролей...])`, НЕ ссылка на `RoleSchema`.** Дубликат списка ролей: `architect` нужно добавить сюда **вручную**, иначе workflow-валидатор отвергнет шаг `role: architect`, даже если `RoleSchema` уже расширен. (Заодно стоит рассмотреть рефактор: заменить inline-enum на `RoleSchema`, чтобы источник истины был один — но это опционально и вне минимального scope.)
+- `src/model-config-dto.ts`: `RoleMapSchema`.
+- `src/model-registry.ts`: `DEFAULT_CONFIG.roles.architect = "claude"`.
+- `ui-web/src/entities/model/index.ts`: `Role`, `ROLE_LABELS`, `ROLE_DESCRIPTIONS`.
+- `ui-web/src/widgets/settings-roles/SettingsRoles.tsx`: `ALL_ROLES`.
+
+⚠️ **`architect` — не editing-роль, но большинство инвариантов `workflow.ts` завязаны на `fan_out`/`review`/`agent`, а не на конкретную роль.** Проверить, что новая роль не ломает проверки строк 83–111 (в частности `non-fan_out steps require an agent` на 110 — для `project-init` шаг не fan_out, значит `agent` обязателен; см. §4.2).
 
 **Назначение:** просканировать структуру проекта и сгенерировать 5 файлов `00-project/*.md`. Не editing-роль: не создаёт worktree, работает в cwd проекта только на чтение.
 
-**Промпт:** инструктирует архитектора просканировать структуру проекта и вернуть **строгий JSON** (парсится раннером, как fan-out plan):
+**Промпт:** инструктирует архитектора просканировать структуру проекта и вернуть **строгий JSON**:
 ```json
 {
   "product": "...",
@@ -116,7 +137,11 @@ levels:
   "stack_rules": "..."
 }
 ```
-Раннер пишет каждый ключ в соответствующий файл (маппинг ключ → файл):
+Важно: общий runner по умолчанию пишет output шага только в blackboard. Для `--init-project` нужен отдельный post-processing path: `runWorkflow(project-init)` → прочитать результат шага `discover` через **`readResult(taskId, "discover")`** (`blackboard.ts:251`, возвращает распарсенный sidecar-JSON воркера) → извлечь текстовый output → `parseArchitectJson(output)` → записать каждый ключ в соответствующий файл → `updateProjectStatus(slug, "ready")`.
+
+Открытый вопрос имплементации: `readResult` возвращает `unknown` (sidecar `WorkerResult`), а не голый stdout. Нужно свериться с формой `WorkerResult` (`src/workers/`), чтобы понять, где именно лежит текст, который architect вернул как JSON (поле результата воркера), и парсить его. `parseArchitectJson` должен переваривать и «голый JSON», и JSON внутри ```json fence (модели часто оборачивают).
+
+Маппинг ключ → файл:
 - `product` → `00-project/product.md`
 - `architecture` → `00-project/architecture.md`
 - `code_map` → `00-project/code-map.md`
@@ -131,10 +156,12 @@ Architect получает контекст через `buildWorkerPrompt`, но
 ### 4.5. Роль `architect` в role map
 Добавляется в `.orchestrator/models.yaml` роль `architect` → по умолчанию `claude` (сильная модель для качественной генерации контекста). Пользователь может переназначить в SettingsRoles.
 
+Миграция: если у пользователя уже есть `models.yaml` без `roles.architect`, `loadModelsConfig()` должен добавить `architect: claude` при загрузке или сохранении, не ломая существующие роли.
+
 ### 4.6. Скелет-заглушки (создаются до architect-фазы)
 Секции `01`–`07` создаются из `src/project-knowledge/templates/` (статические файлы). Только `00-project/` наполняется architect'ом; остальное — lazy или пользовательское.
 
-Заглушки `04-skills/`, `06-mcp/` — `.gitkeep` + markdown с комментарием:
+Заглушки `04-skills/`, `06-mcp/` — `.gitkeep` + `README.md` с комментарием:
 ```markdown
 <!-- 04-skills: доменные knowledge-модули. Наполняются по мере накопления
      экспертизы. Подгружаются инъекцией по роли/задаче. Пока пусто — нормально. -->
@@ -225,10 +252,10 @@ const ctxCache = await loadProjectContextCache(slug);  // одно чтение
 
 | Момент | Кто пишет | Что происходит |
 |---|---|---|
-| **Старт `runWorkflow`** (после `createTask`) | оркестратор | Формируем `activeTask` (title из prompt, goal = prompt целиком, scope = target_paths если есть, пустой AC-чеклист, timestamp). Пишем на диск для персистентности. Запоминаем `baseSha = git rev-parse HEAD` (для touched-files). |
+| **Старт `runWorkflow`** (после `createTask`) | оркестратор | Формируем `activeTask` (title из prompt, goal = prompt целиком, scope = target_paths если есть, пустой AC-чеклист, timestamp). Пишем на диск для персистентности. Запоминаем `baseSha = git rev-parse HEAD` в `projectPath` (для touched-files). ⚠️ Снять `baseSha` **до** создания worktree/integration-ветки, иначе он уже будет содержать изменения. |
 | **После plan-шага** | оркестратор | Если plan вернул структурированные подзадачи/AC — парсим, обновляем `activeTask` в памяти, пишем на диск. Если markdown — оставляем как есть. |
 | **Во время работы** | воркеры не пишут | Только читается через инъекцию (роль `final` сверяет против AC). |
-| **Завершение задачи** (`acceptTask` или `status=done/failed`) | оркестратор | Архивирует: дописывает блок в `07-output/decisions.md` (итог), `07-output/touched-files.md` (`git diff --name-only <baseSha>...<integration-tip>`). `active-task.md` сбрасывается в `idle` шаблон. |
+| **Завершение `runWorkflow`** (success/failure; позже также accept-flow, если он будет отдельным) | оркестратор | Архивирует: дописывает блок в `07-output/decisions.md` (итог), `07-output/touched-files.md`. Diff считать от `baseSha` до tip `integrationBranch(taskId)` (см. `runner.ts:432` — integration-ветка существует именно там): `git diff --name-only <baseSha> <integration-tip>`. ⚠️ Использовать `<a> <b>` (two-dot / без точек), **не** `<a>...<b>` (three-dot merge-base) — three-dot покажет изменения только на одной стороне и на короткоживущих ветках может ввести в заблуждение. `active-task.md` сбрасывается в `idle` шаблон. |
 | **Регенерация контекста** (ручная, позже) | architect | Не трогает `active-task.md` — он оперативный, не часть `00-project`. |
 
 **Формат `active-task.md`:**
@@ -251,7 +278,7 @@ updated: 2026-07-11T14:30:00Z
 ```
 
 ### 5.6. Передача кэша и activeTask
-Через `WorkerOnlyOpts` (уже пробрасывается в `runWorkerOnly` и `runFanOut`): добавляются поля `ctxCache?` и `activeTask?`.
+Через `WorkerOnlyOpts` (уже пробрасывается в `runWorkerOnly`; `runFanOut` его формирует для своих подзадач) добавляются поля `ctxCache?: Map<string, string>` и `activeTask?: string | null`. Т.к. `buildWorkerPrompt` вызывается только в `runWorkerOnly` (§5.7), это единственная структура, которую нужно расширить.
 
 ```typescript
 async function buildProjectContext(
@@ -263,17 +290,19 @@ async function buildProjectContext(
 Чистая функция над данными в памяти: выбирает из кэша по роли, вставляет `activeTask` где роль требует, применяет приоритет + обрезку.
 
 ### 5.7. Как раннер узнаёт slug
-`runWorkerOnly` (runner.ts:190) уже получает `projectPath`. В начале `runWorkflow` (runner.ts:824) после разрешения slug — пробрасывается через `WorkerOnlyOpts` в `runWorkerOnly`, где перед вызовом `buildWorkerPrompt`:
+**Ключевое упрощение (проверено grep'ом):** `buildWorkerPrompt` вызывается ровно в **одном** месте — `runner.ts:241`, внутри `runWorkerOnly` (runner.ts:190). Fan-out (`runFanOut`, runner.ts:518) исполняет подзадачи **тоже через `runWorkerOnly`** (call sites 611, 694), а не отдельным путём. Значит инъекцию достаточно вставить в **одну** точку — `runWorkerOnly` перед строкой 241 — и она автоматически покрывает и линейный путь, и fan-out.
+
+В начале `runWorkflow` (runner.ts:824): `slug = slugFromPath(opts.project)`, `ctxCache = await loadProjectContextCache(slug)`, формируем `activeTask`. Прокидываем `ctxCache`/`activeTask` через `WorkerOnlyOpts` в `runWorkerOnly` (сам `slug` дальше не нужен — кэш уже загружен). Там, перед `buildWorkerPrompt` (241):
 ```typescript
-const projectContext = await buildProjectContext(step.role, ctxCache, activeTask);
-const fullPrompt = buildWorkerPrompt({ ..., projectContext });
+const projectContext = await buildProjectContext(step.role, o.ctxCache, o.activeTask);
+const fullPrompt = buildWorkerPrompt({ ...existing, projectContext });
 ```
-Fan-out (`runFanOut`) — аналогично пробрасывает slug/ctxCache/activeTask в подзадачи.
+`buildProjectContext` — чистая функция над памятью (не читает диск), поэтому вызов на каждом шаге дёшев. Отдельного проброса в `runFanOut` для самой инъекции **не требуется** — только передать ему `ctxCache`/`activeTask`, чтобы он прокинул их в свои вызовы `runWorkerOnly`.
 
 ### 5.8. Деградация
 - Нет директории знаний → `ctxCache` пуст → `projectContext = null` → `buildWorkerPrompt` работает как раньше (обратно совместимо).
 - Часть файлов отсутствует → читаются только существующие.
-- `slug` невалиден → `null`, логируем warning в `.orchestrator/log/`.
+- Ошибка registry/FS при чтении директории знаний → `ctxCache` пуст, логируем warning в `.orchestrator/log/`.
 
 ### 5.9. Почему работает «для всех моделей разом»
 `projectContext` становится частью `envelope.prompt` — единственного аргумента, который получает каждый воркер. `claude -p "<prompt>"`, `codex exec "<prompt>"`, HTTP body api/ollama — все видят контекст одинаково. Никаких per-model хуков, `--system-prompt` флагов, `extraArgs`.
@@ -323,7 +352,7 @@ export async function listProjects(): Promise<ProjectRegistryEntry[]>
 
 | Метод | Путь | Что делает |
 |---|---|---|
-| `POST` | `/projects/open` | body: `{ projectPath }`. Валидация пути → `getOrCreateProject` → если `generating`: запускает workflow `project-init` (сабпроцесс `tsx src/cli.ts --project <path> --workflow project-init`) → возвращает entry + статус. |
+| `POST` | `/projects/open` | body: `{ projectPath }`. Валидация пути → `getOrCreateProject` → если `generating`: запускает `tsx src/cli.ts --project <path> --init-project --project-slug <slug>` → возвращает entry + статус. |
 | `GET` | `/projects` | `listProjects()` — для будущего recent-list. |
 | `GET` | `/projects/:slug` | детали + статус генерации. |
 | `POST` | `/projects/:slug/regenerate` | перегенерация `00-project/` (manual, для будущего). |
@@ -331,7 +360,9 @@ export async function listProjects(): Promise<ProjectRegistryEntry[]>
 Запуск architect-фазы — через существующий `ProcessManager` (умеет спавнить `tsx src/cli.ts` и стримить логи). Отдельный ключ клиента, чтобы UI видел прогресс генерации в LiveLog.
 
 ### 6.4. CLI расширение
-`src/cli.ts` — новый флаг `--init-project`: запускает workflow=project-init и формирует служебный prompt для architect (сканировать структуру, вернуть JSON). `/projects/open` (секция 6.3) вызывает именно `--init-project`, а не голый `--workflow project-init` — флаг гарантирует, что architect получит служебный init-prompt, а не пользовательскую задачу.
+`src/cli.ts` — новый флаг `--init-project`: запускает `workflow=project-init`, формирует служебный prompt для architect (сканировать структуру, вернуть JSON), после завершения парсит JSON результата и пишет `00-project/*.md`. `/projects/open` (секция 6.3) вызывает именно `--init-project`, а не голый `--workflow project-init` — флаг гарантирует, что architect получит служебный init-prompt и что будет выполнен post-processing результата.
+
+Дополнительный флаг `--project-slug <slug>` нужен, чтобы CLI писал в уже созданную запись реестра и не пересчитывал/не создавал другой slug при коллизии.
 
 ### 6.5. UI: кнопка «Открыть проект» в RunForm
 Расширение `ui-web/src/widgets/run-form/RunForm.tsx`:
@@ -397,6 +428,7 @@ templates/
 | Slug-коллизия (разные пути, один basename) | добавляем `-<shortHash(absPath)>`. Запись в реестре хранит полный путь. |
 | Директория знаний существует, но `00-project/` пуст (прерванная генерация) | `status=generating` в реестре → предлагаем перегенерировать. |
 | architect не уложился в бюджет | `00-project/` частично заполнен, пометки `...`. `status=ready` (частичный контекст лучше нуля). Логируем warning. |
+| architect вернул невалидный JSON | `status=failed`, `lastError` содержит parse error, скелет остаётся. UI предлагает retry/regenerate. |
 | Модель `architect` unhealthy | health-gate в `runWorkflow` падает до старта. UI показывает ошибку. |
 | Параллельные «Открыть» один проект | мьютекс в реестре + проверка статуса: если уже `generating` — возвращаем существующую запись. |
 | `~/.orchestrator/` не существует | `mkdir({recursive:true})` (как `initBlackboard`). |
@@ -411,6 +443,7 @@ templates/
 - `slugFromPath` — санитизация, коллизии, unicode.
 - `buildProjectContext` — выбор секций по роли, обрезка по `\n\n` / `\n` / символу, drop-whole, пустые файлы пропускаются.
 - `loadProjectContextCache` — читает union, пропускает отсутствующие.
+- `parseArchitectJson` — JSON в markdown fence/без fence, отсутствующие ключи, невалидный JSON.
 - Жизненный цикл `activeTask` — старт/plan-обновление/архивация, baseSha для touched-files.
 - Реестр — create/find/update, мьютекс, slug-коллизии.
 
@@ -444,6 +477,9 @@ UI-кнопка «Открыть» → индикатор → запуск за�
 | `src/project-knowledge/templates/` (новый) | статические заглушки |
 | `src/prompts/roles.ts` | роль `architect` + параметр `projectContext` в `buildWorkerPrompt` |
 | `src/envelope.ts` | расширить `Role` union: `architect` |
+| `src/model-config-dto.ts` | расширить role map новой ролью `architect` |
+| `src/model-registry.ts` | default/migration для `roles.architect` |
+| `src/workflow.ts` | разрешить роль `architect`; решить контракт `agent` vs role map для non-fanout |
 | `src/runner.ts` | slug + ctxCache + activeTask переменная + baseSha + архивация |
 | `src/cli.ts` | флаг `--init-project` |
 | `workflows/project-init.yaml` (новый) | workflow для architect-фазы |
@@ -453,5 +489,6 @@ UI-кнопка «Открыть» → индикатор → запуск за�
 | `ui-backend/src/process-manager.service.ts` | запуск architect-фазы (переиспользование) |
 | `ui-web/src/shared/api/index.ts` | методы openProject/getProject/listProjects |
 | `ui-web/src/widgets/run-form/RunForm.tsx` | кнопка «Открыть» + индикатор статуса |
-| `ui-web/src/entities/` | типы ProjectEntry, ProjectStatus |
+| `ui-web/src/entities/` | типы ProjectEntry, ProjectStatus; расширить `Role`/labels/descriptions ролью `architect` |
+| `ui-web/src/widgets/settings-roles/SettingsRoles.tsx` | добавить `architect` в список настраиваемых ролей |
 | `scripts/smoke-project-init.ts` (новый) | интеграционный тест |
