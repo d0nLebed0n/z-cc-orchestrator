@@ -36,7 +36,7 @@ assert(wf.fanOuts[0]!.agents.includes("ollama"), "fan_out includes ollama");
 assert(wf.fanOuts[0]!.agents.includes("glm"), "fan_out includes glm");
 assert(wf.fanOuts[0]!.review === true, "fan_out review enabled (codex per subtask)");
 assert(wf.fanOuts[0]!.fromPlanId === "plan", "fan_out reads plan from step 'plan'");
-assert(wf.wf.complexity_threshold === 50, "complexity_threshold = 50 (default, calibrated)");
+assert(wf.wf.complexity_threshold === 65, "complexity_threshold = 65 (default, calibrated)");
 assert(wf.wf.max_parallel === 3, "max_parallel = 3");
 
 // fan_out step itself is excluded from preLevels (runner expands it later).
