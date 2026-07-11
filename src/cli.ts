@@ -17,8 +17,9 @@ import { parse as parseYaml } from "yaml";
 import { config as loadEnv } from "dotenv";
 import { runWorkflow } from "./runner.ts";
 import { acceptTask } from "./worktree.ts";
-import { latestTasks, listLogFiles } from "./blackboard.ts";
+import { latestTasks, listLogFiles, BLACKBOARD_DIR } from "./blackboard.ts";
 import { checkHealthForAgents, formatHealthReport } from "./workers/health.ts";
+import { loadModelsConfig, getModels } from "./model-registry.ts";
 
 // Подгрузить .env.local (GLM-креды и т.п.). silent — файла может не быть.
 loadEnv({ path: ".env.local" });
@@ -41,13 +42,14 @@ function usage(): string {
     "  --project <path>       target repo (default: cwd)",
     "  --max-parallel <n>     cap parallel workers (default: workflow max_parallel or 3)",
     "",
-    "ENV (for GLM steps):",
-    "  GLM_BASE_URL        Z.ai anthropic-compatible endpoint",
-    "  GLM_API_KEY         Z.ai API key",
+    "CONFIG (per-project, in <project>/.orchestrator/):",
+    "  models.yaml         model catalog (id, kind, family, provider, base_url, model)",
+    "  .secrets            <model-id>=<api-key> lines (for api-provider models)",
     "",
-    "ENV (for Ollama/local steps — read from process.env by the worker):",
-    "  OLLAMA_BASE_URL     Ollama OpenAI-compat endpoint",
-    "  OLLAMA_MODEL        model id (e.g. danielsheep/Qwen3-Coder-30B-A3B-Instruct-1M-Unsloth:UD-IQ3_XXS)",
+    "ENV (read from process.env; .env.local loaded by the CLI):",
+    "  OLLAMA_BASE_URL     Ollama OpenAI-compat endpoint (also in models.yaml)",
+    "  OLLAMA_MODEL        model id (also in models.yaml)",
+    "  CLAUDE_BIN / CODEX_BIN  override binary paths for claude-binary / codex-binary kinds",
   ].join("\n");
 }
 
@@ -112,29 +114,33 @@ async function main(): Promise<void> {
     await showStatus();
     return;
   }
+
+  // Проект: дефолт = cwd. Разрешаем рано — он нужен для загрузки реестра моделей
+  // (<project>/.orchestrator/models.yaml) и для всех путей ниже.
+  const project = typeof values.project === "string" ? resolve(values.project) : process.cwd();
+  // Загрузить реестр моделей из проекта. loadModelsConfig сеет дефолтный models.yaml
+  // при отсутствии и читает .secrets. Без этого getModel/getSecret/dispatchWorker/checkHealth
+  // падают с "loadModelsConfig() not called yet".
+  loadModelsConfig(join(project, BLACKBOARD_DIR));
+
   if (values.health) {
-    // Подгрузить GLM env для проверки glm-агента.
-    const glmEnv: Record<string, string> = {};
-    if (process.env.GLM_BASE_URL) glmEnv.ANTHROPIC_BASE_URL = process.env.GLM_BASE_URL;
-    if (process.env.GLM_API_KEY) glmEnv.ANTHROPIC_API_KEY = process.env.GLM_API_KEY;
-    // ollama читает OLLAMA_BASE_URL/OLLAMA_MODEL напрямую из process.env (dotenv
-    // уже выставил их из .env.local). Если base url задан — добавляем в список.
-    const agents: string[] = ["claude", "codex", "glm"];
-    if (process.env.OLLAMA_BASE_URL) agents.push("ollama");
-    console.log("Checking health of all agents...\n");
-    const results = await checkHealthForAgents(agents, Object.keys(glmEnv).length > 0 ? glmEnv : undefined);
+    // Проверяем все модели из реестра. checkHealth читает env (base_url/api_key)
+    // из реестра + секретов, поэтому GLM_BASE_URL/GLM_API_KEY больше не нужны
+    // как отдельный аргумент — они должны лежать в .secrets под id модели.
+    const agents = getModels().map((m) => m.id);
+    console.log("Checking health of all models...\n");
+    const results = await checkHealthForAgents(agents);
     console.log(formatHealthReport(results));
     const unhealthy = [...results.values()].filter((r) => !r.healthy);
     if (unhealthy.length > 0) {
-      console.error(`\n✗ ${unhealthy.length} agent(s) unhealthy`);
+      console.error(`\n✗ ${unhealthy.length} model(s) unhealthy`);
       process.exit(1);
     }
-    console.log("\n✓ All agents healthy");
+    console.log("\n✓ All models healthy");
     return;
   }
   if (values.accept && typeof values.accept === "string") {
     const taskId = values.accept;
-    const project = typeof values.project === "string" ? resolve(values.project) : process.cwd();
     const res = await acceptTask(project, taskId);
     if (res.ok) {
       console.log(`✓ ${taskId}: merged integration → main`);
@@ -159,20 +165,6 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  const project = typeof values.project === "string" ? resolve(values.project) : process.cwd();
-
-  // GLM env: читаем из process.env (GLM_BASE_URL / GLM_API_KEY).
-  const glmEnv: Record<string, string> = {};
-  if (process.env.GLM_BASE_URL) glmEnv.ANTHROPIC_BASE_URL = process.env.GLM_BASE_URL;
-  if (process.env.GLM_API_KEY) glmEnv.ANTHROPIC_API_KEY = process.env.GLM_API_KEY;
-
-  // ollama env: runOllama/checkOllama читают process.env напрямую (dotenv уже
-  // выставил их из .env.local), но раннеру нужен объект для health-gate и
-  // логирования — собираем из тех же значений.
-  const ollamaEnv: Record<string, string> = {};
-  if (process.env.OLLAMA_BASE_URL) ollamaEnv.OLLAMA_BASE_URL = process.env.OLLAMA_BASE_URL;
-  if (process.env.OLLAMA_MODEL) ollamaEnv.OLLAMA_MODEL = process.env.OLLAMA_MODEL;
-
   // max-parallel: CLI флаг > воркфлоу max_parallel > 3 (раннер разрешает финал).
   const maxParallelRaw = typeof values["max-parallel"] === "string" ? values["max-parallel"] : undefined;
   const maxParallel = maxParallelRaw ? Number.parseInt(maxParallelRaw, 10) : undefined;
@@ -186,12 +178,14 @@ async function main(): Promise<void> {
   console.log(`▶ prompt:   ${prompt.slice(0, 100)}${prompt.length > 100 ? "…" : ""}`);
   console.log("");
 
+  // GLM/ollama креды теперь живут в реестре (.orchestrator/models.yaml + .secrets),
+  // а OLLAMA_BASE_URL/OLLAMA_MODEL для runOllama выставляет dotenv из .env.local
+  // напрямую в process.env. Раннеру больше не нужно передавать env-объекты —
+  // dispatchWorker собирает env модели сам из реестра/секретов.
   const result = await runWorkflow({
     workflowPath,
     prompt,
     project,
-    glmEnv: Object.keys(glmEnv).length > 0 ? glmEnv : undefined,
-    ollamaEnv: Object.keys(ollamaEnv).length > 0 ? ollamaEnv : undefined,
     maxParallel,
   });
 

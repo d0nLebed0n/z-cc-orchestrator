@@ -17,10 +17,10 @@ import {
   type LoadedWorkflow,
   type FanOutSpec,
 } from "./workflow.ts";
-import { AGENTS, type AgentName } from "./families.ts";
+import { getAgentFamily } from "./families.ts";
 import { parsePlan, type Subtask, type SubtaskPlan } from "./plan.ts";
 import { makeEnvelope, type TaskEnvelope } from "./envelope.ts";
-import { getWorker, type WorkerResult, type WorkerRunOptions } from "./workers/index.ts";
+import { dispatchWorker, type WorkerResult, type WorkerRunOptions } from "./workers/index.ts";
 import {
   createTask,
   updateTask,
@@ -82,13 +82,6 @@ export interface RunOptions {
   workflowPath: string;
   prompt: string;
   project: string;
-  /** env для GLM (base url + key), если в воркфлоу есть glm-шаги. */
-  glmEnv?: Record<string, string>;
-  /** env для ollama (OLLAMA_BASE_URL / OLLAMA_MODEL), если в fan_out есть ollama.
-   *  runOllama читает process.env напрямую, но раннер должен загрузить эти
-   *  переменные (напр. из .env.local) ДО запуска, чтобы health-gate и worker
-   *  их видели. Task 11 загружает .env.local и выставляет process.env. */
-  ollamaEnv?: Record<string, string>;
   /** Лимит параллельных воркеров (PLAN §5: потолок 3). */
   maxParallel?: number;
 }
@@ -199,8 +192,6 @@ async function runWorkerOnly(
   stepIdx: number,
   prompt: string,
   projectPath: string,
-  glmEnv: Record<string, string> | undefined,
-  ollamaEnv: Record<string, string> | undefined,
   breaker: CircuitBreaker,
   allSteps: ResolvedStep[],
   o: WorkerOnlyOpts = {},
@@ -268,18 +259,11 @@ async function runWorkerOnly(
     allow_same_family: step.allow_same_family,
   });
 
-  // env для воркера: glm → glmEnv (base url + key), ollama → ollamaEnv.
-  // ВАЖНО: runOllama также читает OLLAMA_BASE_URL/OLLAMA_MODEL напрямую из
-  // process.env (Task 11 выставляет их через dotenv из .env.local). ollamaEnv
-  // передаётся сюда для forward-compat — но реальная проводка через process.env.
-  const envFor = step.agent === "glm" ? glmEnv : step.agent === "ollama" ? ollamaEnv : undefined;
+  // WorkerRunOptions: только cwd. dispatchWorker сам собирает env модели
+  // (base_url/api_key/model) из реестра и секретов — раннеру больше не нужно
+  // знать про GLM/ollama креды. На ретраях добавляется wallTimeSecOverride.
+  const workerOpts: WorkerRunOptions = { cwd };
 
-  const workerOpts: WorkerRunOptions = {
-    cwd,
-    env: envFor,
-  };
-
-  const worker = getWorker(step.agent);
   if (breaker.isTripped(step.agent)) {
     await escalateHitl({
       task_id: taskId,
@@ -326,7 +310,7 @@ async function runWorkerOnly(
   const budget = newBudgetState(stepId);
   let result: WorkerResult;
   try {
-    result = await worker(envelope, workerOpts);
+    result = await dispatchWorker(step.agent, envelope, workerOpts);
     const consumed = consumeBudget(budget, envelope, result);
     record.attempts = consumed.attempts;
 
@@ -338,7 +322,7 @@ async function runWorkerOnly(
       const { wall_sec_left } = budgetRemaining(cur, envelope);
       if (wall_sec_left <= 0) break; // бюджет исчерпан — не ретраим
       const retryOpts: WorkerRunOptions = { ...workerOpts, wallTimeSecOverride: wall_sec_left };
-      const retryResult = await worker(envelope, retryOpts);
+      const retryResult = await dispatchWorker(step.agent, envelope, retryOpts);
       cur = consumeBudget(cur, envelope, retryResult);
       if (retryResult.success) {
         result = retryResult;
@@ -432,8 +416,6 @@ async function runStep(
   prompt: string,
   projectPath: string,
   integrationWtPath: string,
-  glmEnv: Record<string, string> | undefined,
-  ollamaEnv: Record<string, string> | undefined,
   breaker: CircuitBreaker,
   allSteps: ResolvedStep[],
   iteration = 1,
@@ -464,8 +446,6 @@ async function runStep(
     stepIdx,
     prompt,
     projectPath,
-    glmEnv,
-    ollamaEnv,
     breaker,
     allSteps,
     { iteration, cwdOverride, contextOverride: ctx },
@@ -531,9 +511,6 @@ interface FanOutOutcome {
  * Phase B (candidate merge + review + promote) → агрегат под базовым stepId.
  *
  * @param integrationWtPath путь к worktree integration-ветки (от setupIntegration)
- * @param glmEnv env для GLM-исполнителей (base url + key)
- * @param ollamaEnv env для ollama-исполнителей (runOllama читает process.env, но
- *   раннер должен их уже выставить — см. Task 11)
  * @param threshold complexity_threshold из воркфлоу (маршрутизация strong vs local)
  * @param maxParallel потолок параллельности Phase A (effectiveMaxParallel)
  */
@@ -544,8 +521,6 @@ async function runFanOut(
   prompt: string,
   projectPath: string,
   integrationWtPath: string,
-  glmEnv: Record<string, string> | undefined,
-  ollamaEnv: Record<string, string> | undefined,
   breaker: CircuitBreaker,
   threshold: number,
   maxParallel: number,
@@ -572,7 +547,7 @@ async function runFanOut(
   }
 
   // ── Маршрутизация + проверка пересечения target_paths (point #11, strict v1). ──
-  type Routed = { subtask: Subtask; agent: AgentName };
+  type Routed = { subtask: Subtask; agent: string };
   const routed: Routed[] = [];
   const failed: string[] = [];
   for (const subtask of plan.subtasks) {
@@ -610,7 +585,7 @@ async function runFanOut(
   // ── Phase A: implement параллельно (БЕЗ merge в integration). ──
   // runBounded ограничивает конкурентность до maxParallel — НИКОГДА не пускаем
   // все implement-ы разом (point #3).
-  type PhaseAResult = { subtask: Subtask; agent: AgentName; result: WorkerResult; stepId: string; wt: WorktreeHandle | null };
+  type PhaseAResult = { subtask: Subtask; agent: string; result: WorkerResult; stepId: string; wt: WorktreeHandle | null };
   const phaseA: (PhaseAResult | null)[] = await runBounded(routed, maxParallel, async ({ subtask, agent }) => {
     if (breaker.isTripped(agent)) {
       await escalateHitl({
@@ -622,20 +597,20 @@ async function runFanOut(
       return null;
     }
     // impl-шаг: клонируем spec.step, подставляя реального исполнителя подзадачи.
-    // agent может быть "ollama" — поэтому ResolvedStep.agent имеет тип AgentName.
+    // agent — id модели из реестра (напр. "ollama"). Семью берём из реестра.
     const implStep: ResolvedStep = {
       ...spec.step,
       agent,
       agentName: agent,
-      family: AGENTS[agent].family,
+      family: getAgentFamily(agent) ?? "anthropic",
       target_paths: subtask.target_paths,
     };
-    // env для воркера: runWorkerOnly сам выбирает glm→glmEnv / ollama→ollamaEnv
-    // по step.agent. ollama также читает process.env напрямую (Task 11 — dotenv).
+    // env для воркера: dispatchWorker сам собирает env модели из реестра/секретов.
+    // ollama также читает OLLAMA_BASE_URL/OLLAMA_MODEL напрямую из process.env (Task 11 — dotenv).
     const { result, stepId, wt } = await runWorkerOnly(
       taskId, implStep, stepIdx,
       `${subtask.goal}\n\nACCEPTANCE CRITERIA: ${subtask.acceptance_criteria}`,
-      projectPath, glmEnv, ollamaEnv, breaker, allSteps,
+      projectPath, breaker, allSteps,
       { subtaskSuffix: `~${subtask.id}` },
     );
     // Коммитим правки в implement-ветку (чтобы они ушли в merge на Phase B), но НЕ мержим.
@@ -709,12 +684,12 @@ async function runFanOut(
       ...spec.step,
       agent: "codex",
       agentName: "codex",
-      family: AGENTS.codex.family,
+      family: getAgentFamily("codex") ?? "openai",
       role: "review",
     };
     const rr = await runWorkerOnly(
       taskId, reviewStep, stepIdx, buildReviewPrompt(item.subtask),
-      projectPath, undefined, undefined, breaker, allSteps,
+      projectPath, breaker, allSteps,
       { subtaskSuffix: `~${item.subtask.id}r`, cwdOverride: candidate.worktreePath, skipWorktree: true },
     );
     const verdict = await parseVerdict(taskId, rr.stepId);
@@ -849,22 +824,21 @@ export async function runWorkflow(opts: RunOptions): Promise<RunResult> {
   // effectiveMaxParallel (point #7): opts.maxParallel ?? wf.max_parallel ?? 3.
   const effectiveMaxParallel = opts.maxParallel ?? loaded.wf.max_parallel ?? 3;
   const threshold = loaded.wf.complexity_threshold;
-  // ollama env: runOllama читает process.env напрямую, но раннер должен знать
-  // о нём для health-gate и логирования (Task 11 выставляет process.env из .env.local).
-  const ollamaEnv = opts.ollamaEnv;
 
-  // ─── Health gate: проверить все агенты воркфлоу ДО создания задачи ───
+  // ─── Health gate: проверить все модели воркфлоу ДО создания задачи ───
   // point #8: uniqueAgents ДОЛЖНЫ включать fanOuts[].agents — иначе ollama
   // (если он есть только в fan_out) не пройдёт health-check и упадёт на запуске.
   // review #1 (Codex): при fan_out.review codex — динамический ревьюер, его
   // нет в agents, но он зовётся на каждой подзадаче. Добавляем явно.
+  // После рефашировки (Task 6.5) checkHealth читает env из реестра/секретов,
+  // поэтому раннеру не нужно передавать glmEnv — только id моделей.
   const uniqueAgents = Array.from(new Set([
     ...allSteps.filter((s) => !s.fan_out).map((s) => s.agentName),
     ...fanOuts.flatMap((f) => f.agents),
-    ...fanOuts.filter((f) => f.review).map(() => "codex" as AgentName),
+    ...fanOuts.filter((f) => f.review).map(() => "codex"),
   ]));
-  const healthResults = await checkHealthForAgents(uniqueAgents, opts.glmEnv);
-  const unhealthy: AgentName[] = [];
+  const healthResults = await checkHealthForAgents(uniqueAgents);
+  const unhealthy: string[] = [];
   for (const [agent, r] of healthResults) {
     if (!r.healthy) unhealthy.push(agent);
   }
@@ -923,12 +897,12 @@ export async function runWorkflow(opts: RunOptions): Promise<RunResult> {
       // Promise.all(level.map(...)) запускал бы весь уровень разом, игнорируя
       // effectiveMaxParallel. runBounded сохраняет порядок результатов.
       const results = await runBounded(level, concurrency, (step) =>
-        runStep(task.id, step, allSteps.indexOf(step), opts.prompt, projectPath, integrationWtPath, opts.glmEnv, ollamaEnv, breaker, allSteps),
+        runStep(task.id, step, allSteps.indexOf(step), opts.prompt, projectPath, integrationWtPath, breaker, allSteps),
       );
       if (!results.every((r) => r.result.success)) overallSuccess = false;
     } else {
       for (const step of level) {
-        const r = await runStep(task.id, step, allSteps.indexOf(step), opts.prompt, projectPath, integrationWtPath, opts.glmEnv, ollamaEnv, breaker, allSteps);
+        const r = await runStep(task.id, step, allSteps.indexOf(step), opts.prompt, projectPath, integrationWtPath, breaker, allSteps);
         if (!r.result.success) {
           overallSuccess = false;
           break; // На последовательном уровне — не продолжаем после провала (HITL).
@@ -945,7 +919,7 @@ export async function runWorkflow(opts: RunOptions): Promise<RunResult> {
     for (const spec of fanOuts) {
       const fo = await runFanOut(
         task.id, spec, allSteps, opts.prompt, projectPath,
-        integrationWtPath, opts.glmEnv, ollamaEnv, breaker,
+        integrationWtPath, breaker,
         threshold, effectiveMaxParallel,
       );
       if (!fo.allApproved) overallSuccess = false;
@@ -959,7 +933,7 @@ export async function runWorkflow(opts: RunOptions): Promise<RunResult> {
       for (const step of level) {
         const r = await runStep(
           task.id, step, allSteps.indexOf(step), opts.prompt,
-          projectPath, integrationWtPath, opts.glmEnv, ollamaEnv, breaker, allSteps,
+          projectPath, integrationWtPath, breaker, allSteps,
         );
         if (!r.result.success) {
           overallSuccess = false;
@@ -1001,7 +975,7 @@ export async function runWorkflow(opts: RunOptions): Promise<RunResult> {
         }
         const r = await runStep(
           task.id, step, allSteps.indexOf(step), opts.prompt,
-          projectPath, integrationWtPath, opts.glmEnv, ollamaEnv, breaker, allSteps,
+          projectPath, integrationWtPath, breaker, allSteps,
           iteration, contextOverride,
         );
         if (!r.result.success) {
@@ -1058,7 +1032,7 @@ export async function runWorkflow(opts: RunOptions): Promise<RunResult> {
       for (const step of level) {
         const r = await runStep(
           task.id, step, allSteps.indexOf(step), opts.prompt,
-          projectPath, integrationWtPath, opts.glmEnv, ollamaEnv, breaker, allSteps,
+          projectPath, integrationWtPath, breaker, allSteps,
         );
         if (!r.result.success) {
           overallSuccess = false;
