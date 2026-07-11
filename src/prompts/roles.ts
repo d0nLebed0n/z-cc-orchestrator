@@ -281,6 +281,37 @@ function finalPrompt(agent: string): string {
   ].join("\n");
 }
 
+/** Роль architect: сканирует структуру проекта и генерирует 00-project/*.md. Не пишет код. */
+function architectPrompt(agent: string): string {
+  return [
+    commonHeader(agent),
+    "",
+    "ROLE: ARCHITECT",
+    "You scan the project structure and produce a knowledge-base document for the",
+    "00-project/ section of this project's knowledge directory. You do NOT write",
+    "application code — only descriptive markdown.",
+    "",
+    "REQUIREMENTS:",
+    "- Inspect the project root, package.json, README, and directory structure.",
+    "- Identify: what the project is (product), how it's built (architecture),",
+    "  where key code lives (code_map), domain terms (glossary), and tech-stack",
+    "  conventions (stack_rules).",
+    "- If the project is empty (no src/, empty package.json), output TODO stubs",
+    '  with a note "project is empty — fill after the first task".',
+    "- Be concise but complete. Use markdown formatting inside each JSON value.",
+    "- If you run low on budget, prioritize architecture and code_map; mark",
+    '  unfinished sections with "...".',
+    "",
+    "OUTPUT FORMAT (STRICT JSON — the runner parses it and writes files):",
+    "Emit ONLY a JSON object (optionally in a ```json fence). Each value is a",
+    "markdown string for one file in 00-project/:",
+    '  { "product": "...", "architecture": "...", "code_map": "...", "glossary": "...", "stack_rules": "..." }',
+    "",
+    "SUCCESS CRITERION: valid JSON with all 5 keys. Each value is non-empty",
+    "markdown describing the corresponding aspect of the project.",
+  ].join("\n");
+}
+
 const ROLE_PROMPTS: Record<Role, (agent: string) => string> = {
   plan: planPrompt,
   implement: implementPrompt,
@@ -288,6 +319,7 @@ const ROLE_PROMPTS: Record<Role, (agent: string) => string> = {
   refine: refinePrompt,
   fix: fixPrompt,
   final: finalPrompt,
+  architect: architectPrompt,
 };
 
 /** Получить system prompt для роли и агента. */
@@ -322,9 +354,15 @@ export function buildWorkerPrompt(input: {
   targetPaths?: string[];
   /** true для воркфлоу с fan_out — plan обязан выдать строгий JSON SubtaskPlan. */
   fanOut?: boolean;
+  /** Контекст проекта из директории знаний (секции 00-project/ + 05-context/). */
+  projectContext?: string;
 }): string {
   const system = systemPromptFor(input.role, input.agent, input.fanOut);
   const parts: string[] = [system, "", "---", ""];
+
+  if (input.projectContext) {
+    parts.push("PROJECT CONTEXT:", input.projectContext, "", "---", "");
+  }
 
   if (input.targetPaths && input.targetPaths.length > 0) {
     parts.push(`TARGET_PATHS (work only in these): ${input.targetPaths.join(", ")}`, "");
