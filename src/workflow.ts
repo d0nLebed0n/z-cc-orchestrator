@@ -7,14 +7,16 @@
  */
 import { z } from "zod";
 import { posix } from "node:path";
-import { AGENTS, type AgentName, type Family } from "./families.ts";
+import { getAgentFamily } from "./families.ts";
+import { getRoleMap } from "./model-registry.ts";
+import type { Family } from "./model-config-dto.ts";
 import type { Subtask } from "./plan.ts";
 
 export const WorkflowStepSchema = z.object({
   /** Имя шага (уникально в воркфлоу). */
   id: z.string().min(1),
   /** Агент шага. Опционален только для fan_out-шагов (исполнитель определяется по подзадаче). */
-  agent: z.enum(["claude", "codex", "glm"]).optional(),
+  agent: z.string().optional(),
   role: z.enum(["plan", "implement", "review", "refine", "fix", "final"]),
   effort: z.enum(["low", "medium", "high", "xhigh"]).default("medium"),
   budget: z.object({
@@ -34,7 +36,7 @@ export const WorkflowStepSchema = z.object({
   /** id plan-шага, чей вывод парсится как SubtaskPlan. Обязательно при fan_out. */
   from_plan: z.string().min(1).optional(),
   /** Допустимые исполнители подзадач. Обязательно при fan_out. */
-  agents: z.array(z.enum(["claude", "codex", "glm", "ollama"])).optional(),
+  agents: z.array(z.string()).optional(),
   /** Добавить codex(review) на каждую подзадачу. */
   review: z.boolean().default(false),
 });
@@ -56,10 +58,11 @@ export type Loop = z.infer<typeof LoopSchema>;
 export const WorkflowSchema = z.object({
   name: z.string().min(1),
   description: z.string().default(""),
-  // default 50: Claude оценивает сложность относительно всей задачи, поэтому
-  // отдельным модулям достаётся 40-60. Порог 50 пускает в ollama только
-  // простейшее (boilerplate), сложную интеграцию/тесты забирает glm.
-  complexity_threshold: z.number().int().min(0).max(100).default(50),
+  // default 65: Claude оценивает сложность относительно всей задачи, поэтому
+  // отдельным модулям достаётся 40-60. Порог 65 пускает в ollama только явный
+  // boilerplate; всё сложнее (интеграция, тесты) забирает glm. Поднят с 50
+  // после анализа провалов ollama (75% успеха против 94% у glm).
+  complexity_threshold: z.number().int().min(0).max(100).default(65),
   max_parallel: z.number().int().positive().default(3),
   /** Линейные шаги ДО цикла (DAG). Могут быть пустым массивом. */
   steps: z.array(WorkflowStepSchema).default([]),
@@ -81,8 +84,13 @@ export const WorkflowSchema = z.object({
   { message: "fan_out steps require from_plan and agents" },
 )
 .refine(
-  (w) => w.steps.every((s) => !s.fan_out || !s.review || !s.agents!.includes("codex")),
-  { message: "fan_out with review cannot list codex in agents (codex is the reviewer)" },
+  (w) => {
+    // Ревьюер для fan_out.review берётся из карты ролей (resolveRole("review"));
+    // раньше был захардкожен "codex". Исполнитель не должен совпадать с ревьюером.
+    const reviewer = getRoleMap().review;
+    return w.steps.every((s) => !s.fan_out || !s.review || !reviewer || !s.agents!.includes(reviewer));
+  },
+  { message: "fan_out with review cannot list the review-role model in agents (it is the reviewer)" },
 )
 // from_plan references an earlier step (declared before it)
 .refine((w) => {
@@ -115,30 +123,33 @@ export const WorkflowSchema = z.object({
 export type Workflow = z.infer<typeof WorkflowSchema>;
 
 /** Дополненный шаг: family выводится из агента. agent всегда определён
- *  (для fan_out-шагов — плейсхолдер из agents[0], реальный исполнитель ставится по подзадаче).
+ *  (для fan_out-шагов — плейсхолдер, реальный исполнитель ставится по подзадаче).
  *
- *  ВАЖНО: agent имеет тип AgentName (включая "ollama"), т.к. при fan-out маршрутизация
- *  подзадачи может выбрать ollama — и тогда раннер строит impl-шаг с agent="ollama".
- *  Для обычных (не fan_out) шагов agent всегда один из claude/codex/glm (схема YAML
- *  не допускает ollama как шагового агента — ollama приходит только через fan_out.agents). */
+ *  ВАЖНО: agent — строка (id модели из реестра). При fan-out маршрутизация
+ *  подзадачи может выбрать local-модель (напр. ollama), и тогда раннер строит
+ *  impl-шаг с этим agent. Для обычных шагов agent берётся из YAML или из
+ *  глобальной карты ролей. */
 export interface ResolvedStep extends Omit<WorkflowStep, "agent"> {
-  agent: AgentName;
+  agent: string;
   family: Family;
-  agentName: AgentName;
+  agentName: string;
 }
 
 export function resolveWorkflow(steps: WorkflowStep[]): ResolvedStep[] {
+  const roleMap = getRoleMap();
   return steps.map((s) => {
-    // fan_out-шаги не имеют агента в схеме — исполнитель определяется по подзадаче.
-    // Даём детерминированный плейсхолдер "claude"; раннер не исполняет fan_out-шаг
-    // напрямую (Task 10 раскрывает его по подзадачам), так что агент шага не используется.
-    const agent: AgentName = (s.agent ?? "claude") as AgentName;
-    return {
-      ...s,
-      agent,
-      agentName: agent,
-      family: AGENTS[agent].family,
-    };
+    // Приоритет: per-step agent (YAML) > глобальная карта ролей из реестра > плейсхолдер "claude".
+    // Это сохраняет обратную совместимость: существующие workflows/*.yaml с явным
+    // agent: продолжают работать, а шаги без agent получают модель по роли из Settings.
+    const agent: string = s.agent ?? roleMap[s.role] ?? "claude";
+    const family = getAgentFamily(agent);
+    if (!family && !s.fan_out) {
+      throw new Error(
+        `resolveWorkflow: model '${agent}' not found (step '${s.id}', role '${s.role}'). ` +
+          `Add it in Settings or set agent explicitly.`,
+      );
+    }
+    return { ...s, agent, agentName: agent, family: family ?? "anthropic" };
   });
 }
 
@@ -273,10 +284,11 @@ export function pathsOverlap(a: string[], b: string[]): boolean {
 }
 
 /** Маршрутизация подзадачи: complexity >= threshold → strong, иначе local. Берёт первого подходящего из agents. */
-export function routeSubtask(subtask: Subtask, agents: AgentName[], threshold: number): AgentName {
+export function routeSubtask(subtask: Subtask, agents: string[], threshold: number): string {
   const strong = subtask.complexity >= threshold;
   for (const a of agents) {
-    const fam = AGENTS[a].family;
+    const fam = getAgentFamily(a);
+    if (!fam) throw new Error(`routeSubtask: unknown model ${a}`);
     if (strong && fam !== "local") return a;
     if (!strong && fam === "local") return a;
   }
@@ -287,7 +299,7 @@ export function routeSubtask(subtask: Subtask, agents: AgentName[], threshold: n
 export interface FanOutSpec {
   step: ResolvedStep;
   fromPlanId: string;
-  agents: AgentName[];
+  agents: string[];
   review: boolean;
 }
 

@@ -10,7 +10,7 @@ async function bootstrap(): Promise<void> {
 
   app.enableCors({
     origin: WEB_ORIGIN,
-    methods: ["GET", "POST"],
+    methods: ["GET", "POST", "PUT", "DELETE"],
   });
 
   // Гарантируем, что SSE-соединения закрываются корректно.

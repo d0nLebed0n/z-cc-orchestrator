@@ -14,14 +14,12 @@ import { truncate } from "./spawn.ts";
 
 const execFileAsync = promisify(execFile);
 
-// Runtime-геттеры (review #2): env читается в момент вызова воркера, а не при
-// импорте модуля. ESM imports в cli.ts выполняются ДО loadEnv(.env.local), и
-// module-level const захватили бы пустой process.env. Дефолты совпадают с
-// .env.local, но переопределение (другой хост/модель) требует runtime-чтения.
-const ollamaBaseUrl = (): string =>
-  process.env.OLLAMA_BASE_URL ?? "http://d0nlebed0n.tail74ba62.ts.net:11434";
-const ollamaModel = (): string =>
-  process.env.OLLAMA_MODEL ?? "danielsheep/Qwen3-Coder-30B-A3B-Instruct-1M-Unsloth:UD-IQ3_XXS";
+// Last-resort дефолты (registry — primary source, см. model-registry.ts DEFAULT_CONFIG).
+// Дублирование с DEFAULT_CONFIG осознанно: safety net на случай, если opts.env
+// пустой и process.env не задан. Совпадают с .orchestrator/models.yaml по умолчанию.
+const OLLAMA_DEFAULT_BASE_URL = "http://d0nlebed0n.tail74ba62.ts.net:11434";
+const OLLAMA_DEFAULT_MODEL =
+  "danielsheep/Qwen3-Coder-30B-A3B-Instruct-1M-Unsloth:UD-IQ3_XXS";
 
 const EDITING_ROLES = new Set(["implement", "refine", "fix"]);
 
@@ -39,16 +37,21 @@ interface ChatMessage {
   content: string;
 }
 
-async function chat(messages: ChatMessage[], timeoutMs: number): Promise<string> {
+async function chat(
+  messages: ChatMessage[],
+  timeoutMs: number,
+  baseUrl: string,
+  model: string,
+): Promise<string> {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
-    const res = await fetch(`${ollamaBaseUrl()}/v1/chat/completions`, {
+    const res = await fetch(`${baseUrl}/v1/chat/completions`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       signal: ctrl.signal,
       body: JSON.stringify({
-        model: ollamaModel(),
+        model,
         messages,
         stream: false,
         temperature: 0,
@@ -67,6 +70,19 @@ async function chat(messages: ChatMessage[], timeoutMs: number): Promise<string>
 
 export const runOllama: WorkerFn = async (envelope, opts) => {
   const start = Date.now();
+  // Runtime-геттеры env (review #2 + Critical fix): читаются в момент вызова
+  // воркера, а не при импорте модуля (ESM imports в cli.ts выполняются ДО
+  // loadEnv(.env.local), и module-level const захватили бы пустой process.env).
+  // Приоритет: opts.env (dispatchWorker из registry) → process.env (.env.local,
+  // backward compat) → hardcoded last-resort defaults.
+  const env = opts.env ?? {};
+  const ollamaBaseUrl = (): string =>
+    env.OLLAMA_BASE_URL ?? process.env.OLLAMA_BASE_URL ?? OLLAMA_DEFAULT_BASE_URL;
+  const ollamaModel = (): string =>
+    env.OLLAMA_MODEL ?? process.env.OLLAMA_MODEL ?? OLLAMA_DEFAULT_MODEL;
+
+  const baseUrl = ollamaBaseUrl();
+  const model = ollamaModel();
   // review #3: на ретраях раннер передаёт остаток бюджета шага.
   const wallSec = opts.wallTimeSecOverride ?? envelope.budget.wall_time_sec;
   const wallMs = wallSec * 1000;
@@ -92,7 +108,7 @@ export const runOllama: WorkerFn = async (envelope, opts) => {
     iters++;
     let reply: string;
     try {
-      reply = await chat(messages, Math.max(2000, wallMs - (Date.now() - start)));
+      reply = await chat(messages, Math.max(2000, wallMs - (Date.now() - start)), baseUrl, model);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       if (/aborted|timeout/i.test(msg)) timedOut = true;

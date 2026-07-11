@@ -11,6 +11,8 @@
     "dev": "tsx src/cli.ts",
     "ai-task": "tsx src/cli.ts",
     "typecheck": "tsc --noEmit",
+    "test": "vitest",
+    "test:run": "vitest run",
     "ui:backend": "cd ui-backend && npm run start:dev",
     "ui:web": "cd ui-web && npm run dev",
     "ui:health": "node scripts/ui-health.mjs",
@@ -28,6 +30,7 @@
     "@types/node": "^22.5.0",
     "concurrently": "^8.2.2",
     "tsx": "^4.23.0",
-    "typescript": "^5.6.0"
+    "typescript": "^5.6.0",
+    "vitest": "^4.1.10"
   }
 }

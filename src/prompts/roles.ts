@@ -13,26 +13,21 @@
  *  - Без clarification-циклов: воркер stateless, не может переспросить —
  *    либо делает, либо возвращает «не смог, причина».
  */
+import { getModel } from "../model-registry.ts";
 import type { Role } from "../envelope.ts";
-import type { AgentName, Family } from "../families.ts";
 
-/** Человекочитаемое имя агента для impersonation (GLM ≠ Claude несмотря на бинарник). */
-function agentIdentity(agent: AgentName, family: Family): string {
-  switch (agent) {
-    case "claude":
-      return "Claude (Anthropic)";
-    case "codex":
-      return "Codex (OpenAI)";
-    case "glm":
-      return "GLM (Z.ai)";
-    case "ollama":
-      return "Qwen3-Coder (local, via Ollama)";
-  }
+/**
+ * Человекочитаемое имя агента для impersonation (GLM ≠ Claude несмотря на бинарник).
+ * Берётся из реестра (model-registry): label задаётся в models.yaml, поэтому
+ * захардкоженный switch по именам больше не нужен.
+ */
+function agentIdentity(agent: string): string {
+  return getModel(agent)?.label ?? agent;
 }
 
 /** Общая шапка для всех ролей: контекст оркестратора + constraints worktree. */
-function commonHeader(agent: AgentName, family: Family): string {
-  const id = agentIdentity(agent, family);
+function commonHeader(agent: string): string {
+  const id = agentIdentity(agent);
   return [
     `You are ${id}, acting as a worker in the z-cc-orchestrator pipeline.`,
     `A Node/TypeScript runner orchestrates you: it gave you a task envelope,`,
@@ -55,9 +50,9 @@ function commonHeader(agent: AgentName, family: Family): string {
 }
 
 /** Роль plan: декомпозиция задачи в список подзадач. Не пишет код. */
-function planPrompt(agent: AgentName, family: Family, fanOut = false): string {
+function planPrompt(agent: string, fanOut = false): string {
   const base = [
-    commonHeader(agent, family),
+    commonHeader(agent),
     "",
     "ROLE: PLANNER",
     "You decompose the task into an ordered list of subtasks for the implementation",
@@ -116,9 +111,9 @@ function planPrompt(agent: AgentName, family: Family, fanOut = false): string {
 }
 
 /** Роль implement: пишет код по плану/задаче. */
-function implementPrompt(agent: AgentName, family: Family): string {
+function implementPrompt(agent: string): string {
   return [
-    commonHeader(agent, family),
+    commonHeader(agent),
     "",
     "ROLE: IMPLEMENTER",
     "You write code to fulfill the task. If a plan is provided in CONTEXT, follow it.",
@@ -138,10 +133,10 @@ function implementPrompt(agent: AgentName, family: Family): string {
   ].join("\n");
 }
 
-/** Роль implement для ollama: не пишет код прозой, а зовёт tools. */
-function ollamaImplementPrompt(): string {
+/** Роль implement для локальных/ollama-http моделей: не пишет код прозой, а зовёт tools. */
+function ollamaImplementPrompt(agent: string): string {
   return [
-    commonHeader("ollama", "local"),
+    commonHeader(agent),
     "",
     "ROLE: IMPLEMENTER (local model, tool-loop)",
     "You implement the task by calling TOOLS. You CANNOT edit files by writing prose —",
@@ -164,9 +159,9 @@ function ollamaImplementPrompt(): string {
 }
 
 /** Роль review: читает код автора (из другой семьи) и возвращает замечания. */
-function reviewPrompt(agent: AgentName, family: Family): string {
+function reviewPrompt(agent: string): string {
   return [
-    commonHeader(agent, family),
+    commonHeader(agent),
     "",
     "ROLE: REVIEWER",
     "You review code written by ANOTHER model family (cross-family review — the",
@@ -197,9 +192,9 @@ function reviewPrompt(agent: AgentName, family: Family): string {
 }
 
 /** Роль refine: исправляет замечания review (обычно тот же агент, что implement). */
-function refinePrompt(agent: AgentName, family: Family): string {
+function refinePrompt(agent: string): string {
   return [
-    commonHeader(agent, family),
+    commonHeader(agent),
     "",
     "ROLE: REFINER",
     "You address the review findings provided in CONTEXT. The reviewer was a",
@@ -226,9 +221,9 @@ function refinePrompt(agent: AgentName, family: Family): string {
 }
 
 /** Роль fix: исправляет конкретный баг/проблему (как refine, но без полного review). */
-function fixPrompt(agent: AgentName, family: Family): string {
+function fixPrompt(agent: string): string {
   return [
-    commonHeader(agent, family),
+    commonHeader(agent),
     "",
     "ROLE: FIXER",
     "You fix a specific problem described in the task/CONTEXT. Unlike refine, there",
@@ -254,9 +249,9 @@ function fixPrompt(agent: AgentName, family: Family): string {
 }
 
 /** Роль final: финальная приёмка. Вердикт ACCEPT/REJECT. */
-function finalPrompt(agent: AgentName, family: Family): string {
+function finalPrompt(agent: string): string {
   return [
-    commonHeader(agent, family),
+    commonHeader(agent),
     "",
     "ROLE: FINAL ACCEPTOR",
     "You perform final acceptance on the completed work. The implementation and",
@@ -286,7 +281,7 @@ function finalPrompt(agent: AgentName, family: Family): string {
   ].join("\n");
 }
 
-const ROLE_PROMPTS: Record<Role, (agent: AgentName, family: Family) => string> = {
+const ROLE_PROMPTS: Record<Role, (agent: string) => string> = {
   plan: planPrompt,
   implement: implementPrompt,
   review: reviewPrompt,
@@ -296,22 +291,29 @@ const ROLE_PROMPTS: Record<Role, (agent: AgentName, family: Family) => string> =
 };
 
 /** Получить system prompt для роли и агента. */
-export function systemPromptFor(role: Role, agent: AgentName, family: Family, fanOut = false): string {
-  if (agent === "ollama" && role === "implement") return ollamaImplementPrompt();
-  if (role === "plan") return planPrompt(agent, family, fanOut);
+export function systemPromptFor(role: Role, agent: string, fanOut = false): string {
+  // Локальные/ollama-http модели на implement идут через tool-loop промпт
+  // (проверяем kind, а не id — модель может быть переименована в models.yaml).
+  if (role === "implement" && getModel(agent)?.kind === "ollama-http") return ollamaImplementPrompt(agent);
+  if (role === "plan") return planPrompt(agent, fanOut);
   const fn = ROLE_PROMPTS[role];
   if (!fn) throw new Error(`No system prompt for role: ${role}`);
-  return fn(agent, family);
+  return fn(agent);
 }
 
 /**
  * Собрать финальный промпт для воркера: system + context + task.
  * Это то, что раннер передаёт в envelope.prompt.
+ *
+ * Примечание: поле family сохранено в интерфейсе для обратной совместимости
+ * с вызывающей стороной (runner.ts), но само значение больше не используется
+ * построителем промптов — impersonation берётся из реестра (getModel).
  */
 export function buildWorkerPrompt(input: {
   role: Role;
-  agent: AgentName;
-  family: Family;
+  agent: string;
+  /** Сохранён для совместимости; не используется построителем. */
+  family?: string;
   /** Исходная задача пользователя (что надо сделать). */
   task: string;
   /** Вывод предыдущего шага (digest / review / plan), или null. */
@@ -321,7 +323,7 @@ export function buildWorkerPrompt(input: {
   /** true для воркфлоу с fan_out — plan обязан выдать строгий JSON SubtaskPlan. */
   fanOut?: boolean;
 }): string {
-  const system = systemPromptFor(input.role, input.agent, input.family, input.fanOut);
+  const system = systemPromptFor(input.role, input.agent, input.fanOut);
   const parts: string[] = [system, "", "---", ""];
 
   if (input.targetPaths && input.targetPaths.length > 0) {

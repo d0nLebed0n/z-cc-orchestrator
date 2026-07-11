@@ -22,4 +22,6 @@ export const PATHS = {
   blackboardDir: join(ORCHESTRATOR_ROOT, ".orchestrator"),
   stateFile: join(ORCHESTRATOR_ROOT, ".orchestrator", "state.json"),
   resultsDir: join(ORCHESTRATOR_ROOT, ".orchestrator", "results"),
+  modelsConfig: join(ORCHESTRATOR_ROOT, ".orchestrator", "models.yaml"),
+  secretsFile: join(ORCHESTRATOR_ROOT, ".orchestrator", ".secrets"),
 } as const;

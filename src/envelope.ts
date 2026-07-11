@@ -6,7 +6,9 @@
  * подставляется в поле `context`.
  */
 import { z } from "zod";
-import { AGENTS, type AgentName, type Family } from "./families.ts";
+import { getAgentFamily } from "./families.ts";
+import { getModel } from "./model-registry.ts";
+import type { Family } from "./model-config-dto.ts";
 
 export const RoleSchema = z.enum([
   "plan",
@@ -33,7 +35,13 @@ export type Budget = z.infer<typeof BudgetSchema>;
 
 export const TaskEnvelopeSchema = z.object({
   id: z.string().min(1),
-  agent: z.enum(["claude", "codex", "glm", "ollama"]),
+  agent: z
+    .string()
+    .min(1)
+    .refine(
+      (id) => getModel(id) !== undefined,
+      (id) => ({ message: `Unknown model: ${id}. Add it in Settings.` }),
+    ),
   family: z.enum(["anthropic", "openai", "zai", "local"]),
   role: RoleSchema,
   prompt: z.string().min(1),
@@ -54,9 +62,12 @@ export const TaskEnvelopeSchema = z.object({
 });
 export type TaskEnvelope = z.infer<typeof TaskEnvelopeSchema>;
 
-/** Согласованность: family в envelope должна совпадать с family агента. */
+/** Согласованность: family в envelope должна совпадать с family агента (по реестру). */
 export function validateEnvelope(e: TaskEnvelope): void {
-  const expectedFamily: Family = AGENTS[e.agent as AgentName].family;
+  const expectedFamily = getAgentFamily(e.agent);
+  if (!expectedFamily) {
+    throw new Error(`Unknown model: ${e.agent}. Add it in Settings.`);
+  }
   if (e.family !== expectedFamily) {
     throw new Error(
       `Envelope family mismatch: agent='${e.agent}' implies family='${expectedFamily}', ` +
@@ -65,13 +76,15 @@ export function validateEnvelope(e: TaskEnvelope): void {
   }
 }
 
-/** Создать envelope с автоматическим выводом family из агента. */
+/** Создать envelope с автоматическим выводом family из агента (по реестру). */
 export function makeEnvelope(
   input: Omit<TaskEnvelope, "family" | "allow_same_family"> &
     Partial<Pick<TaskEnvelope, "family" | "allow_same_family">>,
 ): TaskEnvelope {
-  const agent = input.agent as AgentName;
-  const family: Family = input.family ?? AGENTS[agent].family;
+  const family: Family | undefined = input.family ?? getAgentFamily(input.agent);
+  if (!family) {
+    throw new Error(`Unknown model: ${input.agent}. Add it in Settings.`);
+  }
   const e: TaskEnvelope = TaskEnvelopeSchema.parse({
     ...input,
     family,
