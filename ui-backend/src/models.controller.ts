@@ -33,6 +33,13 @@ export class ModelsController {
     return this.models.detectBinary(kind);
   }
 
+  // Static path: MUST come before any parametric @Get(":id") route, otherwise
+  // GET /models/roles would be captured by the :id segment (id="roles").
+  @Get("roles")
+  async getRoles() {
+    return this.models.getRoles();
+  }
+
   @Post()
   async create(@Body() body: ModelInputDto) {
     try {

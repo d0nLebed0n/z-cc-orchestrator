@@ -77,6 +77,9 @@ export const api = {
   updateRoles: (body: { roles: Record<string, string>; complexity_threshold: number }) =>
     json<{ ok: boolean }>("/models/roles", { method: "PUT", body: JSON.stringify(body) }),
 
+  getRoles: () =>
+    json<{ roles: Record<string, string>; complexity_threshold: number }>("/models/roles"),
+
   /** URL SSE-стрима для EventSource. */
   streamUrl: (key: string) =>
     `${API_URL}/processes/${encodeURIComponent(key)}/stream`,

@@ -178,4 +178,9 @@ export class ModelsService {
     cfg.complexity_threshold = dto.complexity_threshold;
     await this.writeConfig(cfg);
   }
+
+  async getRoles(): Promise<{ roles: Record<string, string>; complexity_threshold: number }> {
+    const cfg = await this.readConfig();
+    return { roles: cfg.roles ?? {}, complexity_threshold: cfg.complexity_threshold ?? 65 };
+  }
 }
