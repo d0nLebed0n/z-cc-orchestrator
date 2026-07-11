@@ -36,7 +36,11 @@ export default function HomePage() {
         }}
       />
 
-      <TaskList refreshKey={refreshKey} />
+      <TaskList
+        refreshKey={refreshKey}
+        disabled={activeKey !== null}
+        onRestart={(key) => setActiveKey(key)}
+      />
     </main>
   );
 }

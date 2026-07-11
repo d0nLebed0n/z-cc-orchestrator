@@ -62,4 +62,32 @@ export class TasksController {
     }
     return { ok: true, message: `merged integration → main for ${id}` };
   }
+
+  /**
+   * Перезапустить задачу: берёт prompt/workflow/project из исходной задачи
+   * и запускает новый subprocess через ProcessManager.start() (с SSE-стримом).
+   * Возвращает clientKey — как POST /processes, чтобы UI стримил логи.
+   */
+  @Post(":id/restart")
+  @HttpCode(200)
+  async restart(@Param("id") id: string) {
+    const task = await this.reader.getTask(id);
+    if (!task) throw new NotFoundException(`task ${id} not found`);
+    const workflowName = task.workflow.split("/").pop()?.replace(/\.ya?ml$/, "") ?? "default";
+    const res = this.manager.start({
+      prompt: task.prompt,
+      workflow: workflowName,
+      project: task.project,
+    });
+    if (!res.ok) {
+      if (res.reason === "busy") {
+        throw new ConflictException({
+          message: "another task is already running",
+          activeTaskId: res.activeTaskId,
+        });
+      }
+      throw new ConflictException(res.message ?? "invalid project");
+    }
+    return { clientKey: res.clientKey, taskId: null };
+  }
 }

@@ -8,11 +8,19 @@ import { truncate, shortTime } from "@/shared/lib/format";
 
 interface Props {
   refreshKey: number;
+  /** Заблокировано ли (задача активна). Кнопки перезапуска скрыты. */
+  disabled?: boolean;
+  /** Колбэк при перезапуске задачи — пробрасывает clientKey для SSE-стрима. */
+  onRestart?: (clientKey: string) => void;
 }
 
-export function TaskList({ refreshKey }: Props) {
+/** Статусы, для которых показываем кнопку перезапуска. */
+const RESTARTABLE = new Set(["failed", "escalated_hitl"]);
+
+export function TaskList({ refreshKey, disabled, onRestart }: Props) {
   const [tasks, setTasks] = useState<TaskRecord[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [restarting, setRestarting] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     try {
@@ -28,6 +36,19 @@ export function TaskList({ refreshKey }: Props) {
     load();
   }, [load, refreshKey]);
 
+  async function restart(taskId: string) {
+    setRestarting(taskId);
+    setError(null);
+    try {
+      const res = await api.restartTask(taskId);
+      onRestart?.(res.clientKey);
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setRestarting(null);
+    }
+  }
+
   return (
     <section style={styles.section}>
       <div style={styles.header}>
@@ -41,6 +62,7 @@ export function TaskList({ refreshKey }: Props) {
       <div style={styles.list}>
         {tasks.map((t) => {
           const p = stepProgress(t);
+          const canRestart = !disabled && RESTARTABLE.has(t.status) && onRestart;
           return (
             <div key={t.id} style={styles.row}>
               <span style={styles.id}>{t.id}</span>
@@ -49,6 +71,16 @@ export function TaskList({ refreshKey }: Props) {
               <span style={styles.prog}>{p.ok}/{p.total}</span>
               <span style={styles.time}>{shortTime(t.updated_at)}</span>
               <span style={styles.prompt}>{truncate(t.prompt, 70)}</span>
+              {canRestart && (
+                <button
+                  onClick={() => restart(t.id)}
+                  disabled={restarting === t.id}
+                  title="Перезапустить задачу"
+                  style={styles.restart}
+                >
+                  {restarting === t.id ? "…" : "↻"}
+                </button>
+              )}
             </div>
           );
         })}
@@ -78,7 +110,7 @@ const styles = {
   list: { display: "flex", flexDirection: "column" as const, gap: 4 },
   row: {
     display: "grid",
-    gridTemplateColumns: "90px 150px 90px 50px 70px 1fr",
+    gridTemplateColumns: "90px 150px 90px 50px 70px 1fr 36px",
     gap: 10,
     alignItems: "center",
     padding: "6px 8px",
@@ -92,4 +124,15 @@ const styles = {
   prompt: { color: "#bac2de", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" as const },
   empty: { color: "#6c7086", padding: "12px 0" },
   error: { color: "#f38ba8", fontSize: 13, marginBottom: 8 },
+  restart: {
+    background: "#313244",
+    color: "#f9e2af",
+    border: "1px solid #45475a",
+    borderRadius: 6,
+    padding: "2px 0",
+    fontSize: 14,
+    cursor: "pointer",
+    lineHeight: 1,
+    textAlign: "center" as const,
+  },
 };

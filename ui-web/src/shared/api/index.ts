@@ -38,6 +38,12 @@ export const api = {
       method: "POST",
     }),
 
+  /** Перезапустить задачу (тот же prompt/workflow/project). Возвращает clientKey для SSE. */
+  restartTask: (id: string) =>
+    json<{ clientKey: string; taskId: null }>(`/tasks/${encodeURIComponent(id)}/restart`, {
+      method: "POST",
+    }),
+
   listModels: () => json<ModelDto[]>("/models"),
 
   createModel: (body: {
