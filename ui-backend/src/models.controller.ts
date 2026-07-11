@@ -8,6 +8,8 @@ import {
   Param,
   Query,
   BadRequestException,
+  NotFoundException,
+  InternalServerErrorException,
 } from "@nestjs/common";
 import { ModelsService } from "./models.service";
 import type { ModelInputDto, UpdateRolesDto } from "./models.dto";
@@ -21,13 +23,35 @@ export class ModelsController {
     return this.models.list();
   }
 
+  // Static paths must be declared BEFORE parametric (:id) routes so that
+  // Express/NestJS does not match them against the :id segment.
+  @Get("detect")
+  async detect(@Query("kind") kind: "claude-binary" | "codex-binary") {
+    if (kind !== "claude-binary" && kind !== "codex-binary") {
+      throw new BadRequestException("kind must be claude-binary or codex-binary");
+    }
+    return this.models.detectBinary(kind);
+  }
+
   @Post()
   async create(@Body() body: ModelInputDto) {
     try {
       return await this.models.create(body);
     } catch (e) {
-      throw new BadRequestException((e as Error).message);
+      // Expected domain error: duplicate id → 400 with the message.
+      const msg = (e as Error).message;
+      if (msg.includes("already exists")) throw new BadRequestException(msg);
+      // Unexpected (filesystem/parse) → 500, do not leak internals.
+      throw new InternalServerErrorException("Failed to create model");
     }
+  }
+
+  // Static path: MUST come before @Put(":id"), otherwise PUT /models/roles
+  // would be captured by the :id route with id="roles".
+  @Put("roles")
+  async updateRoles(@Body() body: UpdateRolesDto) {
+    await this.models.updateRoles(body);
+    return { ok: true };
   }
 
   @Put(":id")
@@ -35,7 +59,11 @@ export class ModelsController {
     try {
       return await this.models.update(id, body);
     } catch (e) {
-      throw new BadRequestException((e as Error).message);
+      const msg = (e as Error).message;
+      // Expected domain error: missing model → 404 with the message.
+      if (msg.includes("not found")) throw new NotFoundException(msg);
+      // Unexpected (filesystem/parse) → 500, do not leak internals.
+      throw new InternalServerErrorException("Failed to update model");
     }
   }
 
@@ -45,21 +73,9 @@ export class ModelsController {
       await this.models.remove(id);
       return { ok: true };
     } catch (e) {
-      throw new BadRequestException((e as Error).message);
+      const msg = (e as Error).message;
+      if (msg.includes("not found")) throw new NotFoundException(msg);
+      throw new InternalServerErrorException("Failed to remove model");
     }
-  }
-
-  @Get("detect")
-  async detect(@Query("kind") kind: "claude-binary" | "codex-binary") {
-    if (kind !== "claude-binary" && kind !== "codex-binary") {
-      throw new BadRequestException("kind must be claude-binary or codex-binary");
-    }
-    return this.models.detectBinary(kind);
-  }
-
-  @Put("roles")
-  async updateRoles(@Body() body: UpdateRolesDto) {
-    await this.models.updateRoles(body);
-    return { ok: true };
   }
 }
