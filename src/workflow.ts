@@ -84,8 +84,13 @@ export const WorkflowSchema = z.object({
   { message: "fan_out steps require from_plan and agents" },
 )
 .refine(
-  (w) => w.steps.every((s) => !s.fan_out || !s.review || !s.agents!.includes("codex")),
-  { message: "fan_out with review cannot list codex in agents (codex is the reviewer)" },
+  (w) => {
+    // Ревьюер для fan_out.review берётся из карты ролей (resolveRole("review"));
+    // раньше был захардкожен "codex". Исполнитель не должен совпадать с ревьюером.
+    const reviewer = getRoleMap().review;
+    return w.steps.every((s) => !s.fan_out || !s.review || !reviewer || !s.agents!.includes(reviewer));
+  },
+  { message: "fan_out with review cannot list the review-role model in agents (it is the reviewer)" },
 )
 // from_plan references an earlier step (declared before it)
 .refine((w) => {

@@ -124,7 +124,9 @@ export class ModelsService {
     const cfg = await this.readConfig();
     const idx = cfg.models.findIndex((m) => m.id === id);
     if (idx === -1) throw new Error(`Model '${id}' not found`);
-    cfg.models[idx] = { ...cfg.models[idx]!, ...input } as StoredModel;
+    // api_key lives ONLY in .secrets — never in models.yaml.
+    const { api_key, ...rest } = input;
+    cfg.models[idx] = { ...cfg.models[idx]!, ...rest } as StoredModel;
     // Если меняется id — обновляем ключ секрета.
     if (input.id && input.id !== id) {
       const secrets = await this.readSecrets();
@@ -134,7 +136,7 @@ export class ModelsService {
         await this.writeSecret(input.id, oldKey);
       }
     }
-    if (input.api_key) await this.writeSecret(input.id ?? id, input.api_key);
+    if (api_key) await this.writeSecret(input.id ?? id, api_key);
     await this.writeConfig(cfg);
     return { ...cfg.models[idx]!, status: await this.statusOf(cfg.models[idx]!) };
   }

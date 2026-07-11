@@ -133,10 +133,10 @@ function implementPrompt(agent: string): string {
   ].join("\n");
 }
 
-/** Роль implement для ollama: не пишет код прозой, а зовёт tools. */
-function ollamaImplementPrompt(): string {
+/** Роль implement для локальных/ollama-http моделей: не пишет код прозой, а зовёт tools. */
+function ollamaImplementPrompt(agent: string): string {
   return [
-    commonHeader("ollama"),
+    commonHeader(agent),
     "",
     "ROLE: IMPLEMENTER (local model, tool-loop)",
     "You implement the task by calling TOOLS. You CANNOT edit files by writing prose —",
@@ -292,7 +292,9 @@ const ROLE_PROMPTS: Record<Role, (agent: string) => string> = {
 
 /** Получить system prompt для роли и агента. */
 export function systemPromptFor(role: Role, agent: string, fanOut = false): string {
-  if (agent === "ollama" && role === "implement") return ollamaImplementPrompt();
+  // Локальные/ollama-http модели на implement идут через tool-loop промпт
+  // (проверяем kind, а не id — модель может быть переименована в models.yaml).
+  if (role === "implement" && getModel(agent)?.kind === "ollama-http") return ollamaImplementPrompt(agent);
   if (role === "plan") return planPrompt(agent, fanOut);
   const fn = ROLE_PROMPTS[role];
   if (!fn) throw new Error(`No system prompt for role: ${role}`);

@@ -39,4 +39,40 @@ describe("model-registry", () => {
     loadModelsConfig(dir);
     expect(getSecret("custom")).toBe("sk-test-123");
   });
+
+  it("migrates GLM_API_KEY from env into .secrets on fresh seed", async () => {
+    const prevKey = process.env.GLM_API_KEY;
+    const prevUrl = process.env.GLM_BASE_URL;
+    process.env.GLM_API_KEY = "sk-glm-from-env";
+    process.env.GLM_BASE_URL = "https://custom.glm.base/api/anthropic";
+    try {
+      const { loadModelsConfig, getSecret } = await import("./model-registry.ts?t=" + Date.now());
+      const cfg = loadModelsConfig(dir);
+      // Key migrated into secretsCache / .secrets.
+      expect(getSecret("glm")).toBe("sk-glm-from-env");
+      // base_url migrated into the seeded models.yaml.
+      const glm = cfg.models.find((m: ModelInfo) => m.id === "glm");
+      expect(glm?.base_url).toBe("https://custom.glm.base/api/anthropic");
+      // .secrets file persisted on disk.
+      const { readFileSync } = await import("node:fs");
+      expect(readFileSync(join(dir, ".secrets"), "utf8")).toContain("glm=sk-glm-from-env");
+    } finally {
+      if (prevKey === undefined) delete process.env.GLM_API_KEY; else process.env.GLM_API_KEY = prevKey;
+      if (prevUrl === undefined) delete process.env.GLM_BASE_URL; else process.env.GLM_BASE_URL = prevUrl;
+    }
+  });
+
+  it("does NOT migrate GLM_API_KEY when .secrets already exists", async () => {
+    writeFileSync(join(dir, ".secrets"), "glm=already-set\n");
+    const prevKey = process.env.GLM_API_KEY;
+    process.env.GLM_API_KEY = "sk-should-be-ignored";
+    try {
+      const { loadModelsConfig, getSecret } = await import("./model-registry.ts?t=" + Date.now());
+      loadModelsConfig(dir);
+      // Existing .secrets takes precedence — no overwrite.
+      expect(getSecret("glm")).toBe("already-set");
+    } finally {
+      if (prevKey === undefined) delete process.env.GLM_API_KEY; else process.env.GLM_API_KEY = prevKey;
+    }
+  });
 });

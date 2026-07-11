@@ -17,7 +17,8 @@ import {
   type LoadedWorkflow,
   type FanOutSpec,
 } from "./workflow.ts";
-import { getAgentFamily } from "./families.ts";
+import { getAgentFamily, pickReviewer } from "./families.ts";
+import { resolveRole } from "./model-registry.ts";
 import { parsePlan, type Subtask, type SubtaskPlan } from "./plan.ts";
 import { makeEnvelope, type TaskEnvelope } from "./envelope.ts";
 import { dispatchWorker, type WorkerResult, type WorkerRunOptions } from "./workers/index.ts";
@@ -678,13 +679,16 @@ async function runFanOut(
         });
       }
     }
-    // codex-review в candidate-worktree (видит смерженный код). skipWorktree + cwdOverride,
+    // review в candidate-worktree (видит смерженный код). skipWorktree + cwdOverride,
     // чтобы runWorkerOnly не создавал собственный worktree — ревьюер работает в candidate.
+    // Ревьюер берётся из глобальной карты ролей (resolveRole("review")), фолбэк —
+    // кросс-семейный pickReviewer по семье исполнителя. Раньше был захардкожен "codex".
+    const reviewerAgent = resolveRole("review") ?? pickReviewer(getAgentFamily(item.agent) ?? "local");
     const reviewStep: ResolvedStep = {
       ...spec.step,
-      agent: "codex",
-      agentName: "codex",
-      family: getAgentFamily("codex") ?? "openai",
+      agent: reviewerAgent,
+      agentName: reviewerAgent,
+      family: getAgentFamily(reviewerAgent) ?? "openai",
       role: "review",
     };
     const rr = await runWorkerOnly(
@@ -697,7 +701,7 @@ async function runFanOut(
       // APPROVE → продвигаем candidate в integration (ff через integration-worktree), cleanup candidate.
       const prom = await promoteCandidateToIntegration(projectPath, taskId, candidate, integrationWtPath);
       if (prom.ok) {
-        summaries.push(`- ${item.subtask.id}: APPROVE (codex)`);
+        summaries.push(`- ${item.subtask.id}: APPROVE (${reviewerAgent})`);
       } else {
         // promote провалился — ff-merge упал ДО cleanup, значит candidate worktree+ветка
         // ещё живы. Вызываем discardCandidate, чтобы не было утечки (он идемпотентен —
@@ -828,14 +832,16 @@ export async function runWorkflow(opts: RunOptions): Promise<RunResult> {
   // ─── Health gate: проверить все модели воркфлоу ДО создания задачи ───
   // point #8: uniqueAgents ДОЛЖНЫ включать fanOuts[].agents — иначе ollama
   // (если он есть только в fan_out) не пройдёт health-check и упадёт на запуске.
-  // review #1 (Codex): при fan_out.review codex — динамический ревьюер, его
-  // нет в agents, но он зовётся на каждой подзадаче. Добавляем явно.
+  // review #1: при fan_out.review ревьюер берётся из карты ролей (resolveRole("review"))
+  // — это динамический ревьюер, его нет в agents, но он зовётся на каждой подзадаче.
+  // Добавляем явно.
   // После рефашировки (Task 6.5) checkHealth читает env из реестра/секретов,
   // поэтому раннеру не нужно передавать glmEnv — только id моделей.
+  const fanOutReviewer = resolveRole("review");
   const uniqueAgents = Array.from(new Set([
     ...allSteps.filter((s) => !s.fan_out).map((s) => s.agentName),
     ...fanOuts.flatMap((f) => f.agents),
-    ...fanOuts.filter((f) => f.review).map(() => "codex"),
+    ...(fanOuts.some((f) => f.review) && fanOutReviewer ? [fanOutReviewer] : []),
   ]));
   const healthResults = await checkHealthForAgents(uniqueAgents);
   const unhealthy: string[] = [];

@@ -2,12 +2,30 @@
  * runApiOpenAi — HTTP-клиент для OpenAI-compatible /v1/chat/completions.
  * Для kind=api, provider=openai. Tool-loop через ollama-tools (content-embedded).
  */
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import type { TaskEnvelope } from "../envelope.ts";
 import type { WorkerFn, WorkerResult } from "./types.ts";
 import { parseToolCalls, executeTool } from "./ollama-tools.ts";
 import { truncate } from "./spawn.ts";
 
+const execFileAsync = promisify(execFile);
+
 const EDITING_ROLES = new Set(["implement", "refine", "fix"]);
+
+/**
+ * Проверка наличия изменений в worktree (зеркало runOllama.gitHasChanges).
+ * Используется сигналом files_changed для editing-ролей — иначе шаг, который
+ * ответил текстом, но не сделал правок, сообщал бы ложный успех.
+ */
+async function gitHasChanges(cwd: string): Promise<boolean> {
+  try {
+    const { stdout } = await execFileAsync("git", ["status", "--porcelain"], { cwd });
+    return stdout.trim().length > 0;
+  } catch {
+    return false;
+  }
+}
 
 interface ChatMessage {
   role: "system" | "user" | "assistant" | "tool";
@@ -96,15 +114,21 @@ export function makeRunApiOpenAi(
 
     const output = truncate(lastAssistant.trim());
     const hasOutput = output.length > 0;
+    const hasChanges = needsEdits ? await gitHasChanges(opts.cwd) : null;
+
     const signals: WorkerResult["signals"] = [
       { name: "exit_0", ok: httpOk, detail: httpOk ? "http 200" : "http error" },
       { name: "nonempty_output", ok: hasOutput, detail: `${output.length} chars` },
     ];
+    if (needsEdits) {
+      signals.push({ name: "files_changed", ok: hasChanges === true, detail: hasChanges ? "yes" : "no" });
+    }
 
     let reason: WorkerResult["reason"] = null;
     if (timedOut) reason = "timeout";
     else if (!httpOk) reason = "error";
     else if (!hasOutput) reason = "no_output";
+    else if (needsEdits && !hasChanges) reason = "no_changes";
 
     const success = signals.every((s) => s.ok);
     return {
@@ -113,7 +137,7 @@ export function makeRunApiOpenAi(
       output,
       timed_out: timedOut,
       has_output: hasOutput,
-      has_changes: null,
+      has_changes: hasChanges,
       signals,
       success,
       reason,
