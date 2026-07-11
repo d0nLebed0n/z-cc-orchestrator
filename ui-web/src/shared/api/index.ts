@@ -90,6 +90,11 @@ export const api = {
       body: JSON.stringify({ projectPath }),
     }),
 
+  pickProjectDirectory: () =>
+    json<{ projectPath: string | null }>(`/projects/pick-directory`, {
+      method: "POST",
+    }),
+
   getProject: (slug: string) =>
     json<ProjectDto>(`/projects/${encodeURIComponent(slug)}`),
 

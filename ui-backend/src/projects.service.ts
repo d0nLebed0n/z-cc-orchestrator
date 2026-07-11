@@ -1,6 +1,10 @@
 import { Injectable, Logger, Inject } from "@nestjs/common";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { ProcessManager } from "./process-manager.service";
 import { validateProjectPath, validationMessage } from "./path-utils";
+
+const execFileAsync = promisify(execFile);
 
 export interface ProjectDto {
   slug: string;
@@ -17,6 +21,27 @@ export class ProjectsService {
   // @Inject явно: tsx (esbuild) не эмитит decorator metadata для constructors,
   // поэтому неявная DI по типу не работает для provider→provider зависимостей.
   constructor(@Inject(ProcessManager) private readonly processManager: ProcessManager) {}
+
+  /**
+   * Открыть системный picker директории на машине, где запущен ui-backend.
+   * Это локальный desktop-flow: браузер не может безопасно отдать абсолютный
+   * путь через обычный file input, поэтому путь выбирает backend-процесс.
+   */
+  async pickDirectory(): Promise<{ projectPath: string | null }> {
+    try {
+      const projectPath =
+        process.platform === "darwin"
+          ? await pickDirectoryMac()
+          : process.platform === "win32"
+            ? await pickDirectoryWindows()
+            : await pickDirectoryLinux();
+      return { projectPath };
+    } catch (e) {
+      const msg = (e as Error).message;
+      if (msg === "cancelled") return { projectPath: null };
+      throw e;
+    }
+  }
 
   /**
    * Открыть проект: валидация пути → запуск CLI --init-project (который сам
@@ -100,4 +125,68 @@ export class ProjectsService {
     const project = await this.readFromRegistry(entry.projectPath);
     return { project };
   }
+}
+
+async function pickDirectoryMac(): Promise<string> {
+  const script = [
+    'set selectedFolder to choose folder with prompt "Выбери корень git-репозитория"',
+    "POSIX path of selectedFolder",
+  ].join("\n");
+  const { stdout } = await execFileAsync("osascript", ["-e", script]);
+  return normalizePickerOutput(stdout);
+}
+
+async function pickDirectoryWindows(): Promise<string> {
+  const command = [
+    "Add-Type -AssemblyName System.Windows.Forms;",
+    "$dialog = New-Object System.Windows.Forms.FolderBrowserDialog;",
+    "$dialog.Description = 'Выбери корень git-репозитория';",
+    "if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {",
+    "  Write-Output $dialog.SelectedPath",
+    "} else {",
+    "  exit 2",
+    "}",
+  ].join(" ");
+  try {
+    const { stdout } = await execFileAsync("powershell.exe", [
+      "-NoProfile",
+      "-STA",
+      "-Command",
+      command,
+    ]);
+    return normalizePickerOutput(stdout);
+  } catch (e) {
+    if (isExitCode(e, 2)) throw new Error("cancelled");
+    throw e;
+  }
+}
+
+async function pickDirectoryLinux(): Promise<string> {
+  const candidates: Array<{ cmd: string; args: string[] }> = [
+    { cmd: "zenity", args: ["--file-selection", "--directory", "--title=Выбери корень git-репозитория"] },
+    { cmd: "kdialog", args: ["--getexistingdirectory", process.cwd(), "Выбери корень git-репозитория"] },
+  ];
+  let lastError: unknown;
+  for (const candidate of candidates) {
+    try {
+      const { stdout } = await execFileAsync(candidate.cmd, candidate.args);
+      return normalizePickerOutput(stdout);
+    } catch (e) {
+      if (isExitCode(e, 1)) throw new Error("cancelled");
+      lastError = e;
+    }
+  }
+  throw new Error(
+    `Не удалось открыть системный выбор папки. Установи zenity/kdialog или введи путь вручную. ${String(lastError ?? "")}`,
+  );
+}
+
+function normalizePickerOutput(stdout: string): string {
+  const selected = stdout.trim();
+  if (!selected) throw new Error("cancelled");
+  return selected.length > 1 ? selected.replace(/\/$/, "") : selected;
+}
+
+function isExitCode(e: unknown, code: number): boolean {
+  return typeof e === "object" && e !== null && "code" in e && (e as { code?: unknown }).code === code;
 }

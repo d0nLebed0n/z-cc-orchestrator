@@ -19,6 +19,7 @@ export function RunForm({ disabled, onStarted }: Props) {
   const [loading, setLoading] = useState(false);
   const [projectInfo, setProjectInfo] = useState<ProjectDto | null>(null);
   const [opening, setOpening] = useState(false);
+  const [pickingProject, setPickingProject] = useState(false);
 
   useEffect(() => {
     api.listWorkflows().then(setWorkflows).catch(() => {});
@@ -42,18 +43,38 @@ export function RunForm({ disabled, onStarted }: Props) {
     }
   }
 
-  async function openProject() {
-    if (!project.trim()) return;
+  async function openProjectPath(projectPath: string) {
+    if (!projectPath.trim()) return;
     setOpening(true);
     setError(null);
     try {
-      const res = await api.openProject(project.trim());
+      const res = await api.openProject(projectPath.trim());
       setProjectInfo(res.project);
     } catch (e) {
       setError((e as Error).message);
       setProjectInfo(null);
     } finally {
       setOpening(false);
+    }
+  }
+
+  async function openProject() {
+    await openProjectPath(project);
+  }
+
+  async function pickProjectDirectory() {
+    setPickingProject(true);
+    setError(null);
+    try {
+      const res = await api.pickProjectDirectory();
+      if (!res.projectPath) return;
+      setProject(res.projectPath);
+      setProjectInfo(null);
+      await openProjectPath(res.projectPath);
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setPickingProject(false);
     }
   }
 
@@ -85,22 +106,38 @@ export function RunForm({ disabled, onStarted }: Props) {
             ))}
           </select>
         </label>
-        <label style={styles.field}>
+        <label style={{ ...styles.field, flex: "2 1 320px" }}>
           <span style={styles.label}>Проект (путь к git-репозиторию)</span>
-          <div style={{ display: "flex", gap: 8 }}>
+          <div style={styles.projectControls}>
             <input
               placeholder="/Users/ilyalebedev/Desktop/iva-gang/numbers"
               value={project}
               onChange={(e) => { setProject(e.target.value); setProjectInfo(null); }}
-              style={{ ...styles.input, flex: 1 }}
+              style={{ ...styles.input, flex: "1 1 0", minWidth: 0 }}
               disabled={disabled}
             />
             <button
+              type="button"
+              onClick={pickProjectDirectory}
+              disabled={disabled || pickingProject || opening}
+              title="Выбрать папку через системный диалог"
+              style={{
+                ...styles.secondaryButton,
+                flexShrink: 0,
+                ...(disabled || pickingProject || opening ? styles.buttonDisabled : {}),
+                whiteSpace: "nowrap" as const,
+              }}
+            >
+              {pickingProject ? "Выбор…" : "Выбрать…"}
+            </button>
+            <button
+              type="button"
               onClick={openProject}
               disabled={disabled || opening || !project.trim()}
               style={{
                 ...styles.button,
                 background: "#a6e3a1",
+                flexShrink: 0,
                 ...(disabled || opening || !project.trim() ? styles.buttonDisabled : {}),
                 whiteSpace: "nowrap" as const,
               }}
@@ -114,6 +151,7 @@ export function RunForm({ disabled, onStarted }: Props) {
           disabled={disabled || loading || !prompt.trim()}
           style={{
             ...styles.button,
+            flexShrink: 0,
             ...(disabled || loading || !prompt.trim() ? styles.buttonDisabled : {}),
           }}
         >
@@ -165,6 +203,7 @@ const styles = {
   },
   row: { display: "flex", gap: 12, alignItems: "flex-end", flexWrap: "wrap" as const },
   field: { display: "flex", flexDirection: "column" as const, gap: 4, flex: 1, minWidth: 160 },
+  projectControls: { display: "flex", gap: 8, flexWrap: "nowrap" as const, alignItems: "center" },
   label: { fontSize: 12, color: "#a6adc8" },
   select: inputStyle(),
   input: inputStyle(),
@@ -174,6 +213,17 @@ const styles = {
     border: "none",
     borderRadius: 8,
     padding: "10px 20px",
+    fontWeight: 600,
+    cursor: "pointer",
+    fontSize: 14,
+    height: 40,
+  },
+  secondaryButton: {
+    background: "#181825",
+    color: "#cdd6f4",
+    border: "1px solid #45475a",
+    borderRadius: 8,
+    padding: "10px 14px",
     fontWeight: 600,
     cursor: "pointer",
     fontSize: 14,
