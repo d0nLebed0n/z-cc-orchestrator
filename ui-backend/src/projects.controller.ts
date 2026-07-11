@@ -1,5 +1,5 @@
 import {
-  Controller, Get, Post, Body, Param,
+  Controller, Get, Post, Body, Param, Inject,
   BadRequestException, NotFoundException, InternalServerErrorException,
 } from "@nestjs/common";
 import { ProjectsService } from "./projects.service";
@@ -10,7 +10,9 @@ interface OpenBody {
 
 @Controller("projects")
 export class ProjectsController {
-  constructor(private readonly projects: ProjectsService) {}
+  // @Inject явно: tsx (esbuild) не эмитит decorator metadata, поэтому
+  // неявная DI по типу параметра конструктора не работает.
+  constructor(@Inject(ProjectsService) private readonly projects: ProjectsService) {}
 
   @Get()
   async list() {

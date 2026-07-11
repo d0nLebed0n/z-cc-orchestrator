@@ -1,4 +1,4 @@
-import { Injectable, Logger } from "@nestjs/common";
+import { Injectable, Logger, Inject } from "@nestjs/common";
 import { ProcessManager } from "./process-manager.service";
 import { validateProjectPath, validationMessage } from "./path-utils";
 
@@ -14,7 +14,9 @@ export interface ProjectDto {
 export class ProjectsService {
   private readonly logger = new Logger(ProjectsService.name);
 
-  constructor(private readonly processManager: ProcessManager) {}
+  // @Inject явно: tsx (esbuild) не эмитит decorator metadata для constructors,
+  // поэтому неявная DI по типу не работает для provider→provider зависимостей.
+  constructor(@Inject(ProcessManager) private readonly processManager: ProcessManager) {}
 
   /**
    * Открыть проект: валидация пути → запуск CLI --init-project (который сам
