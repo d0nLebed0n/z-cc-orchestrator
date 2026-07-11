@@ -1,48 +1,41 @@
 /**
  * Семьи моделей и правила кросс-семейного ревью (PLAN §1, §3.4).
  *
- * Три семьи: Anthropic (Claude), OpenAI (Codex), Z.ai (GLM).
- * GLM запускается бинарником `claude`, но считается отдельной семьёй Z.ai —
- * для правил ревью он чужой по отношению к Anthropic-Claude.
+ * Семьи фиксированы (anthropic/openai/zai/local) — это семантическое понятие
+ * для cross-family review. Каталог конкретных моделей — в model-registry.
+ *
+ * `Family` переэкспортируется из model-config-dto (Task 2) для обратной
+ * совместимости: остальные модули импортируют его отсюда.
  */
+import { getModels, getModel } from "./model-registry.ts";
+import type { Family } from "./model-config-dto.ts";
 
-export type Family = "anthropic" | "openai" | "zai" | "local";
-export type AgentName = "claude" | "codex" | "glm" | "ollama";
+export type { Family };
 
-export interface AgentInfo {
-  name: AgentName;
-  family: Family;
-  /** Каким бинарником запускается (справочно). local-агенты не имеют CLI — binary "none". */
-  binary: "claude" | "codex" | "ollama" | "none";
-}
-
-export const AGENTS: Record<AgentName, AgentInfo> = {
-  claude: { name: "claude", family: "anthropic", binary: "claude" },
-  codex: { name: "codex", family: "openai", binary: "codex" },
-  glm: { name: "glm", family: "zai", binary: "claude" },
-  ollama: { name: "ollama", family: "local", binary: "ollama" },
-};
-
-/** Все семьи, отличные от данной и способные ревьюить. local — implement-only, не ревьюер. */
+/** Все семьи, отличные от данной и способные ревьюить. local — implement-only. */
 const REVIEWER_FAMILIES: Family[] = ["anthropic", "openai", "zai"];
 
 export function validReviewerFamilies(author: Family): Family[] {
   return REVIEWER_FAMILIES.filter((f) => f !== author);
 }
 
+/** Семья модели по id (из реестра). */
+export function getAgentFamily(id: string): Family | undefined {
+  return getModel(id)?.family;
+}
+
 /**
- * Выбрать агента-ревьюера из семьи, отличной от автора кода.
- * @param authorFamily семья автора кода (кто писал на шаге implement)
- * @param prefer предпочтительный агент, если он подходит по семье
- * @returns агент-ревьюер из чужой семьи
- * @throws если предпочтённый агент той же семьи (это ошибка валидации воркфлоу)
+ * Выбрать модель-ревьюера из семьи, отличной от автора кода.
+ * @param authorFamily семья автора кода
+ * @param prefer предпочтительный id модели (опционально)
+ * @returns id модели-ревьюера из чужой семьи
  */
-export function pickReviewer(
-  authorFamily: Family,
-  prefer?: AgentName,
-): AgentName {
+export function pickReviewer(authorFamily: Family, prefer?: string): string {
   if (prefer) {
-    const preferFamily = AGENTS[prefer].family;
+    const preferFamily = getModel(prefer)?.family;
+    if (!preferFamily) {
+      throw new CrossFamilyViolation(`pickReviewer: model '${prefer}' not found in registry`);
+    }
     if (preferFamily === authorFamily) {
       throw new CrossFamilyViolation(
         `Reviewer '${prefer}' (${preferFamily}) same family as author (${authorFamily}). ` +
@@ -52,13 +45,15 @@ export function pickReviewer(
     return prefer;
   }
   const valid = validReviewerFamilies(authorFamily);
-  // ollama никогда не ревьюер (local — implement-only); выбираем из сильных семей.
-  const candidate: AgentName =
-    valid.includes("anthropic") ? "claude"
-    : valid.includes("openai") ? "codex"
-    : valid.includes("zai") ? "glm"
-    : "claude";
-  return candidate;
+  // Берём первую модель подходящей семьи из реестра (порядок как в models.yaml).
+  for (const fam of valid) {
+    const m = getModels().find((x) => x.family === fam);
+    if (m) return m.id;
+  }
+  // Фолбэк: первая доступная не-local модель.
+  const fallback = getModels().find((m) => m.family !== "local");
+  if (!fallback) throw new CrossFamilyViolation("No reviewer model available in registry");
+  return fallback.id;
 }
 
 export class CrossFamilyViolation extends Error {

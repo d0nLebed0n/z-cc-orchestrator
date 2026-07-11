@@ -19,7 +19,6 @@ import { runWorkflow } from "./runner.ts";
 import { acceptTask } from "./worktree.ts";
 import { latestTasks, listLogFiles } from "./blackboard.ts";
 import { checkHealthForAgents, formatHealthReport } from "./workers/health.ts";
-import type { AgentName } from "./families.ts";
 
 // Подгрузить .env.local (GLM-креды и т.п.). silent — файла может не быть.
 loadEnv({ path: ".env.local" });
@@ -120,7 +119,7 @@ async function main(): Promise<void> {
     if (process.env.GLM_API_KEY) glmEnv.ANTHROPIC_API_KEY = process.env.GLM_API_KEY;
     // ollama читает OLLAMA_BASE_URL/OLLAMA_MODEL напрямую из process.env (dotenv
     // уже выставил их из .env.local). Если base url задан — добавляем в список.
-    const agents: AgentName[] = ["claude", "codex", "glm"];
+    const agents: string[] = ["claude", "codex", "glm"];
     if (process.env.OLLAMA_BASE_URL) agents.push("ollama");
     console.log("Checking health of all agents...\n");
     const results = await checkHealthForAgents(agents, Object.keys(glmEnv).length > 0 ? glmEnv : undefined);
