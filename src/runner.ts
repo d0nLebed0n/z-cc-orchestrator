@@ -60,6 +60,7 @@ import { buildWorkerPrompt } from "./prompts/roles.ts";
 import { checkHealthForAgents, formatHealthReport } from "./workers/health.ts";
 import { slugFromPath } from "./project-knowledge/slug.ts";
 import { loadProjectContextCache, buildProjectContext } from "./project-knowledge/context.ts";
+import { archiveTask } from "./project-knowledge/archive.ts";
 
 /** Ограниченный пул конкурентности: не больше maxParallel одновременно. Сохраняет порядок результатов. */
 export async function runBounded<T, U>(
@@ -1116,6 +1117,33 @@ export async function runWorkflow(opts: RunOptions): Promise<RunResult> {
   }
 
   await updateTask(task.id, { status: overallSuccess ? "done" : "escalated_hitl" });
+
+  // ─── Архивация в директорию знаний (07-output + active-task reset) ───
+  // Diff: baseSha (снят ДО worktree) → tip integration-ветки. two-dot, не three-dot.
+  let changedFiles: string[] = [];
+  if (baseSha) {
+    try {
+      const { stdout } = await git(projectPath, ["diff", "--name-only", baseSha, integrationBranch(task.id)]);
+      changedFiles = stdout.trim().split("\n").filter(Boolean);
+    } catch {
+      // integration-ветка может быть уже удалена (cleanup при провале) — логируем, не падаем.
+      await logEvent({
+        task_id: task.id, step_id: null, level: "warn",
+        kind: "archive_diff_failed",
+        message: `Could not compute touched-files diff for ${task.id} (baseSha=${baseSha.slice(0, 8)})`,
+      });
+    }
+  }
+  try {
+    await archiveTask(slug, task.id, opts.prompt, overallSuccess, baseSha, changedFiles);
+  } catch (e) {
+    // Архивация — best-effort, не должна валить задачу.
+    await logEvent({
+      task_id: task.id, step_id: null, level: "warn",
+      kind: "archive_failed",
+      message: `archiveTask failed: ${e instanceof Error ? e.message : String(e)}`,
+    });
+  }
 
   // При провале — cleanup integration worktree (ветку оставляем для разбора).
   // При успехе — worktree живёт до acceptTask (ветка нужна для merge в main).
