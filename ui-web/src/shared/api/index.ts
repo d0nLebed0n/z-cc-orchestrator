@@ -1,5 +1,5 @@
 import { API_URL } from "../config";
-import type { TaskRecord, WorkflowDto } from "@/entities";
+import type { ModelDto, TaskRecord, WorkflowDto } from "@/entities";
 
 async function json<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`${API_URL}${path}`, {
@@ -37,6 +37,45 @@ export const api = {
     json<{ ok: boolean; message: string }>(`/tasks/${encodeURIComponent(id)}/accept`, {
       method: "POST",
     }),
+
+  listModels: () => json<ModelDto[]>("/models"),
+
+  createModel: (body: {
+    id: string;
+    label: string;
+    kind: ModelDto["kind"];
+    family: ModelDto["family"];
+    provider?: "anthropic" | "openai";
+    base_url?: string;
+    model?: string;
+    api_key?: string;
+  }) =>
+    json<ModelDto>("/models", { method: "POST", body: JSON.stringify(body) }),
+
+  updateModel: (id: string, body: Partial<{
+    label: string;
+    kind: ModelDto["kind"];
+    family: ModelDto["family"];
+    provider: "anthropic" | "openai";
+    base_url: string;
+    model: string;
+    api_key: string;
+  }>) =>
+    json<ModelDto>(`/models/${encodeURIComponent(id)}`, {
+      method: "PUT",
+      body: JSON.stringify(body),
+    }),
+
+  deleteModel: (id: string) =>
+    json<{ ok: boolean }>(`/models/${encodeURIComponent(id)}`, { method: "DELETE" }),
+
+  detectBinary: (kind: "claude-binary" | "codex-binary") =>
+    json<{ found: boolean; path?: string; version?: string }>(
+      `/models/detect?kind=${kind}`,
+    ),
+
+  updateRoles: (body: { roles: Record<string, string>; complexity_threshold: number }) =>
+    json<{ ok: boolean }>("/models/roles", { method: "PUT", body: JSON.stringify(body) }),
 
   /** URL SSE-стрима для EventSource. */
   streamUrl: (key: string) =>
