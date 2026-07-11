@@ -41,6 +41,8 @@ function usage(): string {
     "  --workflow <name>      workflow yaml in workflows/ (default: default)",
     "  --project <path>       target repo (default: cwd)",
     "  --max-parallel <n>     cap parallel workers (default: workflow max_parallel or 3)",
+    "  --init-project         initialize project knowledge directory (architect role)",
+    "  --project-slug <slug>  explicit slug for the project (used with --init-project)",
     "",
     "CONFIG (per-project, in <project>/.orchestrator/):",
     "  models.yaml         model catalog (id, kind, family, provider, base_url, model)",
@@ -96,6 +98,8 @@ async function main(): Promise<void> {
       status: { type: "boolean", default: false },
       health: { type: "boolean", default: false },
       accept: { type: "string" },
+      "init-project": { type: "boolean", default: false },
+      "project-slug": { type: "string" },
       help: { type: "boolean", short: "h", default: false },
     },
     allowPositionals: true,
@@ -148,6 +152,83 @@ async function main(): Promise<void> {
       console.error(`✗ ${taskId}: merge failed — ${res.message}`);
       process.exit(1);
     }
+    return;
+  }
+
+  if (values["init-project"]) {
+    // ─── Режим инициализации директории знаний проекта ───
+    // CLI сам вызывает getOrCreateProject (создаёт запись реестра с правильным slug,
+    // включая коллизионный суффикс если нужно), затем запускает workflow project-init
+    // (роль architect), парсит JSON-результат и пишет 00-project/*.md.
+    // --project-slug опционален: если задан — используем его (regenerate случая),
+    // иначе slug берём из getOrCreateProject.
+    const { getOrCreateProject, updateProjectStatus, knowledgeDirFor } = await import("./project-knowledge/registry.ts");
+    const { copySkeleton } = await import("./project-knowledge/skeleton.ts");
+    const { scanProjectStructure, parseArchitectJson, writeProjectFiles } = await import("./project-knowledge/architect.ts");
+    const { readResult: readResultBb } = await import("./blackboard.ts");
+    const { existsSync: exists } = await import("node:fs");
+
+    // 1. Создать/найти запись реестра → получить slug (с учётом коллизий).
+    const explicitSlug = typeof values["project-slug"] === "string" ? values["project-slug"] : undefined;
+    let slug: string;
+    if (explicitSlug) {
+      slug = explicitSlug;
+    } else {
+      const entry = await getOrCreateProject(project);
+      slug = entry.slug;
+    }
+
+    // 2. Скопировать скелет (если ещё не скопирован).
+    const knowledgeDir = knowledgeDirFor(slug);
+    if (!exists(knowledgeDir)) {
+      await copySkeleton(knowledgeDir);
+    }
+
+    // 3. Запустить workflow project-init.
+    const initPrompt = "Analyze this project and generate the 00-project knowledge base files.";
+    const workflowPath = join(WORKFLOWS_DIR, "project-init.yaml");
+    if (!existsSync(workflowPath)) {
+      console.error(`Workflow not found: ${workflowPath}`);
+      process.exit(1);
+    }
+    console.log(`▶ init-project: slug=${slug}`);
+    console.log(`▶ project:      ${project}`);
+
+    const result = await runWorkflow({
+      workflowPath,
+      prompt: initPrompt,
+      project,
+    });
+
+    if (!result.success) {
+      await updateProjectStatus(slug, "failed", `architect workflow failed for task ${result.task.id}`);
+      console.error(`\n✗ architect workflow failed. Task: ${result.task.id}`);
+      process.exit(1);
+    }
+
+    // 4. Post-process: прочитать результат шага discover, распарсить JSON, писать файлы.
+    // Шаг discover — единственный в project-init, его stepId = <taskId>-S01.
+    const discoverStepId = `${result.task.id}-S01`;
+    const raw = await readResultBb(result.task.id, discoverStepId);
+    if (!raw || typeof raw !== "object" || !("output" in raw)) {
+      await updateProjectStatus(slug, "failed", "architect result missing output");
+      console.error(`✗ architect result has no output`);
+      process.exit(1);
+    }
+    const output = String((raw as { output: string }).output);
+    const parsed = parseArchitectJson(output);
+    if (!parsed) {
+      await updateProjectStatus(slug, "failed", `could not parse architect JSON from output (first 200 chars): ${output.slice(0, 200)}`);
+      console.error(`✗ could not parse architect JSON`);
+      console.error(`  output (first 500): ${output.slice(0, 500)}`);
+      process.exit(1);
+    }
+    await writeProjectFiles(slug, parsed);
+    await updateProjectStatus(slug, "ready");
+
+    console.log(`\n✓ project knowledge generated for slug '${slug}'`);
+    console.log(`  knowledge dir: ${knowledgeDir}`);
+    console.log(`  files written: 00-project/{product,architecture,code-map,glossary,stack-rules}.md`);
     return;
   }
 
