@@ -5,7 +5,7 @@
   "type": "module",
   "description": "Оркестрация трёх AI-CLI (Claude, Codex, GLM) единым Node/TS-раннером.",
   "bin": {
-    "ai-task": "bin/ai-task.js"
+    "ai-task": "bin/ai-task"
   },
   "scripts": {
     "dev": "tsx src/cli.ts",
@@ -13,10 +13,10 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest",
     "test:run": "vitest run",
-    "ui:backend": "cd ui-backend && npm run start:dev",
-    "ui:web": "cd ui-web && npm run dev",
-    "ui:health": "node scripts/ui-health.mjs",
-    "ui:open": "node scripts/open-browser.mjs",
+    "ui:backend": "tsx scripts/run-ui-backend.ts",
+    "ui:web": "tsx scripts/run-ui-web.ts",
+    "ui:health": "tsx scripts/ui-health.ts",
+    "ui:open": "tsx scripts/open-browser.ts",
     "ui": "concurrently -n backend,web -c blue,green \"npm:ui:backend\" \"npm:ui:web\"",
     "ui:full": "concurrently -n backend,web,open -c blue,green,yellow \"npm:ui:backend\" \"npm:ui:web\" \"npm:ui:open\""
   },
