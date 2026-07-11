@@ -17,7 +17,7 @@ export const WorkflowStepSchema = z.object({
   id: z.string().min(1),
   /** Агент шага. Опционален только для fan_out-шагов (исполнитель определяется по подзадаче). */
   agent: z.string().optional(),
-  role: z.enum(["plan", "implement", "review", "refine", "fix", "final"]),
+  role: z.enum(["plan", "implement", "review", "refine", "fix", "final", "architect"]),
   effort: z.enum(["low", "medium", "high", "xhigh"]).default("medium"),
   budget: z.object({
     wall_time_sec: z.number().int().positive(),

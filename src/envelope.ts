@@ -17,6 +17,7 @@ export const RoleSchema = z.enum([
   "refine",
   "fix",
   "final",
+  "architect",
 ]);
 export type Role = z.infer<typeof RoleSchema>;
 

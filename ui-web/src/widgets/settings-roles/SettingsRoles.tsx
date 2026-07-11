@@ -22,7 +22,7 @@ const selectStyle: React.CSSProperties = {
   width: "100%",
 };
 
-const ALL_ROLES: Role[] = ["plan", "implement", "review", "refine", "fix", "final"];
+const ALL_ROLES: Role[] = ["plan", "implement", "review", "refine", "fix", "final", "architect"];
 
 export function SettingsRoles() {
   const [models, setModels] = useState<ModelDto[]>([]);

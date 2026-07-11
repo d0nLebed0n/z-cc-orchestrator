@@ -1,6 +1,6 @@
 export type Family = "anthropic" | "openai" | "zai" | "local";
 export type ModelKind = "claude-binary" | "codex-binary" | "ollama-http" | "api";
-export type Role = "plan" | "implement" | "review" | "refine" | "fix" | "final";
+export type Role = "plan" | "implement" | "review" | "refine" | "fix" | "final" | "architect";
 export type RoleMap = Partial<Record<Role, string>>;
 
 export interface ModelDto {
@@ -21,6 +21,7 @@ export const ROLE_LABELS: Record<Role, string> = {
   refine: "Доработка",
   fix: "Фикс",
   final: "Финал",
+  architect: "Архитектор",
 };
 
 export const ROLE_DESCRIPTIONS: Record<Role, string> = {
@@ -30,6 +31,7 @@ export const ROLE_DESCRIPTIONS: Record<Role, string> = {
   refine: "Доработка по замечаниям ревью",
   fix: "Исправление ошибок",
   final: "Финальная проверка/сборка",
+  architect: "Генерация контекста проекта при открытии",
 };
 
 export const KIND_LABELS: Record<ModelKind, string> = {

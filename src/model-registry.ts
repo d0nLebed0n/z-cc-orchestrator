@@ -37,6 +37,7 @@ export const DEFAULT_CONFIG: ModelsConfig = {
     refine: "glm",
     fix: "glm",
     final: "claude",
+    architect: "claude",
   },
   complexity_threshold: 65,
 };
@@ -56,6 +57,11 @@ export function loadModelsConfig(dir: string): ModelsConfig {
     const raw = readFileSync(modelsPath, "utf8");
     const parsed = ModelsConfigSchema.parse(parseYaml(raw));
     cached = parsed;
+    // Миграция: добавить роль architect, если её нет (новая роль с этого коммита).
+    if (!cached.roles.architect) {
+      cached.roles.architect = "claude";
+      writeFileSync(modelsPath, stringifyYaml(cached), "utf8");
+    }
   } else {
     cached = structuredClone(DEFAULT_CONFIG);
     // One-time миграция (PLAN §6): при первичном сидинге — если GLM_BASE_URL
