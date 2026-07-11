@@ -1,5 +1,6 @@
 import { Injectable } from "@nestjs/common";
-import { readFile, writeFile, existsSync } from "node:fs";
+import { readFile, writeFile, existsSync, mkdirSync } from "node:fs";
+import { dirname } from "node:path";
 import { promisify } from "node:util";
 import { execFile } from "node:child_process";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
@@ -26,6 +27,43 @@ interface ModelsConfig {
   complexity_threshold: number;
 }
 
+/**
+ * Дефолтный конфиг при отсутствии models.yaml.
+ * Должен совпадать с DEFAULT_CONFIG в src/model-registry.ts (движок).
+ * Сеется и бэкендом, и движком — кто первый обратится к отсутствующему файлу.
+ */
+const DEFAULT_CONFIG: ModelsConfig = {
+  models: [
+    { id: "claude", label: "Claude (local)", kind: "claude-binary", family: "anthropic" },
+    { id: "codex", label: "Codex (local)", kind: "codex-binary", family: "openai" },
+    {
+      id: "glm",
+      label: "GLM (Z.ai)",
+      kind: "api",
+      family: "zai",
+      provider: "anthropic",
+      base_url: "https://api.z.ai/api/anthropic",
+    },
+    {
+      id: "ollama",
+      label: "Ollama (Tailscale)",
+      kind: "ollama-http",
+      family: "local",
+      base_url: "http://d0nlebed0n.tail74ba62.ts.net:11434",
+      model: "danielsheep/Qwen3-Coder-30B-A3B-Instruct-1M-Unsloth:UD-IQ3_XXS",
+    },
+  ],
+  roles: {
+    plan: "claude",
+    implement: "glm",
+    review: "codex",
+    refine: "glm",
+    fix: "glm",
+    final: "claude",
+  },
+  complexity_threshold: 65,
+};
+
 export interface ModelDto {
   id: string;
   label: string;
@@ -41,14 +79,24 @@ export interface ModelDto {
 export class ModelsService {
   private async readConfig(): Promise<ModelsConfig> {
     if (!existsSync(PATHS.modelsConfig)) {
-      // Сеется движком при первом запуске; если файла нет — вернём пустой.
-      return { models: [], roles: {}, complexity_threshold: 65 };
+      // Файла нет — сеем дефолт (4 модели + роли + threshold) и пишем на диск.
+      // Консистентно с движком (src/model-registry.ts DEFAULT_CONFIG).
+      await this.writeConfig(DEFAULT_CONFIG);
+      return DEFAULT_CONFIG;
     }
     const raw = await readFileAsync(PATHS.modelsConfig, "utf8");
-    return parseYaml(raw) as ModelsConfig;
+    const parsed = parseYaml(raw) as ModelsConfig;
+    // Толерантность к частично-заполненному конфигу (напр. только models без roles).
+    return {
+      models: parsed.models ?? [],
+      roles: parsed.roles ?? {},
+      complexity_threshold: parsed.complexity_threshold ?? 65,
+    };
   }
 
   private async writeConfig(cfg: ModelsConfig): Promise<void> {
+    // .orchestrator/ может не существовать при первом обращении — создаём.
+    mkdirSync(dirname(PATHS.modelsConfig), { recursive: true });
     await writeFileAsync(PATHS.modelsConfig, stringifyYaml(cfg), "utf8");
   }
 
@@ -67,6 +115,7 @@ export class ModelsService {
     const existing = await this.readSecrets();
     existing.set(id, key);
     const lines = [...existing.entries()].map(([k, v]) => `${k}=${v}`);
+    mkdirSync(dirname(PATHS.secretsFile), { recursive: true });
     await writeFileAsync(PATHS.secretsFile, lines.join("\n") + "\n", "utf8");
   }
 
