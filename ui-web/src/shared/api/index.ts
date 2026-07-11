@@ -1,5 +1,5 @@
 import { API_URL } from "../config";
-import type { ModelDto, TaskRecord, WorkflowDto } from "@/entities";
+import type { ModelDto, TaskRecord, WorkflowDto, ProjectDto } from "@/entities";
 
 async function json<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`${API_URL}${path}`, {
@@ -83,4 +83,16 @@ export const api = {
   /** URL SSE-стрима для EventSource. */
   streamUrl: (key: string) =>
     `${API_URL}/processes/${encodeURIComponent(key)}/stream`,
+
+  openProject: (projectPath: string) =>
+    json<{ project: ProjectDto; clientKey: string | null }>(`/projects/open`, {
+      method: "POST",
+      body: JSON.stringify({ projectPath }),
+    }),
+
+  getProject: (slug: string) =>
+    json<ProjectDto>(`/projects/${encodeURIComponent(slug)}`),
+
+  listProjects: () =>
+    json<ProjectDto[]>(`/projects`),
 };

@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { api } from "@/shared/api";
-import type { WorkflowDto } from "@/entities";
+import type { WorkflowDto, ProjectDto } from "@/entities";
 
 interface Props {
   /** Активна ли сейчас задача (форма заблокирована). */
@@ -17,6 +17,8 @@ export function RunForm({ disabled, onStarted }: Props) {
   const [workflows, setWorkflows] = useState<WorkflowDto[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const [projectInfo, setProjectInfo] = useState<ProjectDto | null>(null);
+  const [opening, setOpening] = useState(false);
 
   useEffect(() => {
     api.listWorkflows().then(setWorkflows).catch(() => {});
@@ -37,6 +39,21 @@ export function RunForm({ disabled, onStarted }: Props) {
       setError((e as Error).message);
     } finally {
       setLoading(false);
+    }
+  }
+
+  async function openProject() {
+    if (!project.trim()) return;
+    setOpening(true);
+    setError(null);
+    try {
+      const res = await api.openProject(project.trim());
+      setProjectInfo(res.project);
+    } catch (e) {
+      setError((e as Error).message);
+      setProjectInfo(null);
+    } finally {
+      setOpening(false);
     }
   }
 
@@ -70,13 +87,27 @@ export function RunForm({ disabled, onStarted }: Props) {
         </label>
         <label style={styles.field}>
           <span style={styles.label}>Проект (путь к git-репозиторию)</span>
-          <input
-            placeholder="/Users/ilyalebedev/Desktop/iva-gang/numbers"
-            value={project}
-            onChange={(e) => setProject(e.target.value)}
-            style={styles.input}
-            disabled={disabled}
-          />
+          <div style={{ display: "flex", gap: 8 }}>
+            <input
+              placeholder="/Users/ilyalebedev/Desktop/iva-gang/numbers"
+              value={project}
+              onChange={(e) => { setProject(e.target.value); setProjectInfo(null); }}
+              style={{ ...styles.input, flex: 1 }}
+              disabled={disabled}
+            />
+            <button
+              onClick={openProject}
+              disabled={disabled || opening || !project.trim()}
+              style={{
+                ...styles.button,
+                background: "#a6e3a1",
+                ...(disabled || opening || !project.trim() ? styles.buttonDisabled : {}),
+                whiteSpace: "nowrap" as const,
+              }}
+            >
+              {opening ? "Открытие…" : "Открыть"}
+            </button>
+          </div>
         </label>
         <button
           onClick={submit}
@@ -89,6 +120,17 @@ export function RunForm({ disabled, onStarted }: Props) {
           {loading ? "Запуск…" : disabled ? "Занято" : "Запустить"}
         </button>
       </div>
+      {projectInfo && (
+        <div style={{ marginTop: 8, fontSize: 13, display: "flex", alignItems: "center", gap: 6 }}>
+          <span>{projectInfo.status === "ready" ? "🟢" : projectInfo.status === "generating" ? "🟡" : "🔴"}</span>
+          <span style={{ color: "#a6adc8" }}>
+            {projectInfo.slug} ({projectInfo.status})
+          </span>
+          {projectInfo.status === "failed" && projectInfo.lastError && (
+            <span style={{ color: "#f38ba8", fontSize: 12 }}>— {projectInfo.lastError}</span>
+          )}
+        </div>
+      )}
       <div style={styles.hint}>
         Абсолютный путь к <b>корню git-репозитория</b>, не к файлу. Ведущая{" "}
         <code style={styles.code}>~</code> разворачивается в домашнюю директорию.

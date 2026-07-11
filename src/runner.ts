@@ -58,6 +58,9 @@ import {
 } from "./worktree.ts";
 import { buildWorkerPrompt } from "./prompts/roles.ts";
 import { checkHealthForAgents, formatHealthReport } from "./workers/health.ts";
+import { slugFromPath } from "./project-knowledge/slug.ts";
+import { loadProjectContextCache, buildProjectContext } from "./project-knowledge/context.ts";
+import { archiveTask } from "./project-knowledge/archive.ts";
 
 /** Ограниченный пул конкурентности: не больше maxParallel одновременно. Сохраняет порядок результатов. */
 export async function runBounded<T, U>(
@@ -175,6 +178,10 @@ interface WorkerOnlyOpts {
    *  Если undefined → contextFromPrevStep (для editing-ролей) или null
    *  (для review-in-candidate при fan-out). */
   contextOverride?: string | null;
+  /** Кэш контекста проекта (immutable, загружается один раз в runWorkflow). */
+  ctxCache?: Map<string, string>;
+  /** Текущий active-task (строка markdown, из переменной в runWorkflow). */
+  activeTask?: string | null;
 }
 
 /**
@@ -238,6 +245,10 @@ async function runWorkerOnly(
   // Воркер получает готовый промпт, не сырую задачу (PLAN §5.2).
   // Для plan-шага, питающего fan_out, требуем строгий JSON SubtaskPlan.
   const fanOutPlan = o.fanOut ?? (step.role === "plan" && allSteps.some((s) => s.fan_out && s.from_plan === step.id));
+  // Инъекция контекста проекта (для architect — null, он получает live-скан).
+  const projectContext = o.ctxCache
+    ? buildProjectContext(step.role, o.ctxCache, o.activeTask ?? null)
+    : null;
   const fullPrompt = buildWorkerPrompt({
     role: step.role,
     agent: step.agentName,
@@ -246,6 +257,7 @@ async function runWorkerOnly(
     context,
     targetPaths: step.target_paths,
     fanOut: fanOutPlan,
+    projectContext: projectContext ?? undefined,
   });
 
   const envelope: TaskEnvelope = makeEnvelope({
@@ -422,6 +434,10 @@ async function runStep(
   iteration = 1,
   /** Явный context (для цикла: раннер сам считает по итерации). Если undefined — contextFromPrevStep. */
   contextOverride?: string | null,
+  /** Кэш контекста проекта (immutable, загружается один раз в runWorkflow). */
+  ctxCache?: Map<string, string>,
+  /** Текущий active-task (строка markdown, из переменной в runWorkflow). */
+  activeTask?: string | null,
 ): Promise<StepRun> {
   // review/final: работают в integration-worktree, где виден смерженный код
   //  (иначе reviewer смотрит на пустой main и не видит работу implementer-а).
@@ -449,7 +465,7 @@ async function runStep(
     projectPath,
     breaker,
     allSteps,
-    { iteration, cwdOverride, contextOverride: ctx },
+    { iteration, cwdOverride, contextOverride: ctx, ctxCache, activeTask },
   );
 
   // Merge worktree в integration после успеха (только для editing-ролей — у
@@ -525,6 +541,8 @@ async function runFanOut(
   breaker: CircuitBreaker,
   threshold: number,
   maxParallel: number,
+  ctxCache?: Map<string, string>,
+  activeTask?: string | null,
 ): Promise<FanOutOutcome> {
   const stepIdx = allSteps.indexOf(spec.step);
   const planStepIdx = allSteps.findIndex((s) => s.id === spec.fromPlanId);
@@ -612,7 +630,7 @@ async function runFanOut(
       taskId, implStep, stepIdx,
       `${subtask.goal}\n\nACCEPTANCE CRITERIA: ${subtask.acceptance_criteria}`,
       projectPath, breaker, allSteps,
-      { subtaskSuffix: `~${subtask.id}` },
+      { subtaskSuffix: `~${subtask.id}`, ctxCache, activeTask },
     );
     // Коммитим правки в implement-ветку (чтобы они ушли в merge на Phase B), но НЕ мержим.
     if (wt && result.success) {
@@ -694,7 +712,7 @@ async function runFanOut(
     const rr = await runWorkerOnly(
       taskId, reviewStep, stepIdx, buildReviewPrompt(item.subtask),
       projectPath, breaker, allSteps,
-      { subtaskSuffix: `~${item.subtask.id}r`, cwdOverride: candidate.worktreePath, skipWorktree: true },
+      { subtaskSuffix: `~${item.subtask.id}r`, cwdOverride: candidate.worktreePath, skipWorktree: true, ctxCache, activeTask },
     );
     const verdict = await parseVerdict(taskId, rr.stepId);
     if (verdict === "APPROVE" || verdict === "ACCEPT") {
@@ -829,6 +847,24 @@ export async function runWorkflow(opts: RunOptions): Promise<RunResult> {
   const effectiveMaxParallel = opts.maxParallel ?? loaded.wf.max_parallel ?? 3;
   const threshold = loaded.wf.complexity_threshold;
 
+  // ─── Контекст проекта: загрузить кэш один раз (immutable на прогон) ───
+  const slug = slugFromPath(projectPath);
+  let ctxCache: Map<string, string>;
+  try {
+    ctxCache = await loadProjectContextCache(slug);
+  } catch (e) {
+    await logEvent({
+      task_id: "—", step_id: null, level: "warn",
+      kind: "project_context_load_failed",
+      message: `Failed to load project context for slug '${slug}': ${e instanceof Error ? e.message : String(e)}`,
+    });
+    ctxCache = new Map();
+  }
+  // active-task: переменная в scope runWorkflow (не дисковое чтение).
+  // Формируется на старте, обновляется после plan-шага, архивируется при завершении.
+  let activeTask: string | null = null;
+  let baseSha: string | null = null;
+
   // ─── Health gate: проверить все модели воркфлоу ДО создания задачи ───
   // point #8: uniqueAgents ДОЛЖНЫ включать fanOuts[].agents — иначе ollama
   // (если он есть только в fan_out) не пройдёт health-check и упадёт на запуске.
@@ -875,6 +911,34 @@ export async function runWorkflow(opts: RunOptions): Promise<RunResult> {
     status: "running",
   });
 
+  // ─── active-task: формируем из prompt, пишем на диск для персистентности ───
+  const activeTaskNow = new Date().toISOString();
+  activeTask = [
+    "# Active Task",
+    `status: in_progress`,
+    `updated: ${activeTaskNow}`,
+    "",
+    "## Goal",
+    opts.prompt,
+    "",
+    "## Scope",
+    `- target_paths: ${opts.project}`,
+    "",
+    "## Acceptance Criteria",
+    "(pending plan step)",
+    "",
+    "## Notes",
+    "",
+  ].join("\n");
+  // baseSha: снимаем ДО создания worktree/integration-ветки (иначе он уже
+  // будет содержать изменения). Нужен для touched-files при архивации.
+  try {
+    const { stdout } = await git(projectPath, ["rev-parse", "HEAD"]);
+    baseSha = stdout.trim();
+  } catch {
+    baseSha = null;
+  }
+
   // Оборачиваем тело в try/catch: при ЛЮБОЙ необработанной ошибке (напр.
   // git-падение в setupIntegration/merge) ставить задаче status=failed и
   // логировать, а не бросать наружу — иначе задача висит в running навсегда.
@@ -903,12 +967,12 @@ export async function runWorkflow(opts: RunOptions): Promise<RunResult> {
       // Promise.all(level.map(...)) запускал бы весь уровень разом, игнорируя
       // effectiveMaxParallel. runBounded сохраняет порядок результатов.
       const results = await runBounded(level, concurrency, (step) =>
-        runStep(task.id, step, allSteps.indexOf(step), opts.prompt, projectPath, integrationWtPath, breaker, allSteps),
+        runStep(task.id, step, allSteps.indexOf(step), opts.prompt, projectPath, integrationWtPath, breaker, allSteps, 1, undefined, ctxCache, activeTask),
       );
       if (!results.every((r) => r.result.success)) overallSuccess = false;
     } else {
       for (const step of level) {
-        const r = await runStep(task.id, step, allSteps.indexOf(step), opts.prompt, projectPath, integrationWtPath, breaker, allSteps);
+        const r = await runStep(task.id, step, allSteps.indexOf(step), opts.prompt, projectPath, integrationWtPath, breaker, allSteps, 1, undefined, ctxCache, activeTask);
         if (!r.result.success) {
           overallSuccess = false;
           break; // На последовательном уровне — не продолжаем после провала (HITL).
@@ -927,6 +991,7 @@ export async function runWorkflow(opts: RunOptions): Promise<RunResult> {
         task.id, spec, allSteps, opts.prompt, projectPath,
         integrationWtPath, breaker,
         threshold, effectiveMaxParallel,
+        ctxCache, activeTask,
       );
       if (!fo.allApproved) overallSuccess = false;
     }
@@ -940,6 +1005,7 @@ export async function runWorkflow(opts: RunOptions): Promise<RunResult> {
         const r = await runStep(
           task.id, step, allSteps.indexOf(step), opts.prompt,
           projectPath, integrationWtPath, breaker, allSteps,
+          1, undefined, ctxCache, activeTask,
         );
         if (!r.result.success) {
           overallSuccess = false;
@@ -982,7 +1048,7 @@ export async function runWorkflow(opts: RunOptions): Promise<RunResult> {
         const r = await runStep(
           task.id, step, allSteps.indexOf(step), opts.prompt,
           projectPath, integrationWtPath, breaker, allSteps,
-          iteration, contextOverride,
+          iteration, contextOverride, ctxCache, activeTask,
         );
         if (!r.result.success) {
           stepFailed = true;
@@ -1039,6 +1105,7 @@ export async function runWorkflow(opts: RunOptions): Promise<RunResult> {
         const r = await runStep(
           task.id, step, allSteps.indexOf(step), opts.prompt,
           projectPath, integrationWtPath, breaker, allSteps,
+          1, undefined, ctxCache, activeTask,
         );
         if (!r.result.success) {
           overallSuccess = false;
@@ -1050,6 +1117,33 @@ export async function runWorkflow(opts: RunOptions): Promise<RunResult> {
   }
 
   await updateTask(task.id, { status: overallSuccess ? "done" : "escalated_hitl" });
+
+  // ─── Архивация в директорию знаний (07-output + active-task reset) ───
+  // Diff: baseSha (снят ДО worktree) → tip integration-ветки. two-dot, не three-dot.
+  let changedFiles: string[] = [];
+  if (baseSha) {
+    try {
+      const { stdout } = await git(projectPath, ["diff", "--name-only", baseSha, integrationBranch(task.id)]);
+      changedFiles = stdout.trim().split("\n").filter(Boolean);
+    } catch {
+      // integration-ветка может быть уже удалена (cleanup при провале) — логируем, не падаем.
+      await logEvent({
+        task_id: task.id, step_id: null, level: "warn",
+        kind: "archive_diff_failed",
+        message: `Could not compute touched-files diff for ${task.id} (baseSha=${baseSha.slice(0, 8)})`,
+      });
+    }
+  }
+  try {
+    await archiveTask(slug, task.id, opts.prompt, overallSuccess, baseSha, changedFiles);
+  } catch (e) {
+    // Архивация — best-effort, не должна валить задачу.
+    await logEvent({
+      task_id: task.id, step_id: null, level: "warn",
+      kind: "archive_failed",
+      message: `archiveTask failed: ${e instanceof Error ? e.message : String(e)}`,
+    });
+  }
 
   // При провале — cleanup integration worktree (ветку оставляем для разбора).
   // При успехе — worktree живёт до acceptTask (ветка нужна для merge в main).
