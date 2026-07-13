@@ -1,6 +1,6 @@
 import { homedir } from "node:os";
 import { resolve, isAbsolute, join } from "node:path";
-import { existsSync, statSync, type Stats } from "node:fs";
+import { existsSync, statSync, realpathSync, type Stats } from "node:fs";
 
 /**
  * Развернуть ~ и ~/... в домашнюю директорию.
@@ -44,7 +44,15 @@ export function validateProjectPath(raw: string): ValidationResult {
   if (!existsSync(gitDir)) {
     return { ok: false, reason: "not_git_repo", path: abs };
   }
-  return { ok: true, path: abs };
+  // Канонизируем через realpath — единый принцип с sanitizePath (review #E):
+  // все файловые операции должны держаться внутри канонического корня, иначе
+  // symlink на проектный корень даст разные "корни" для валидации и для worktree.
+  try {
+    const canonical = realpathSync(abs);
+    return { ok: true, path: canonical };
+  } catch {
+    return { ok: false, reason: "not_found", path: abs };
+  }
 }
 
 /** Человекочитаемое сообщение об ошибке валидации (для фронта/логов). */

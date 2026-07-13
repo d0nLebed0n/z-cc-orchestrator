@@ -1,10 +1,9 @@
 name: ui
 description: |
-  Фронтенд/Nuxt: glm имплементит UI → codex ревьюит.
-  Кросс-семейность: Z.ai(implement) → OpenAI(review). PLAN §3.2.
+  Фронтенд-задачи: implement (высокий effort — UI-код объёмный) → review.
+  Модели берутся из карты ролей Settings (role → model), а не хардкожены.
 steps:
   - id: implement
-    agent: glm
     role: implement
     effort: high
     budget:
@@ -14,7 +13,6 @@ steps:
     target_paths: []
 
   - id: review
-    agent: codex
     role: review
     effort: medium
     budget:

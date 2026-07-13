@@ -35,6 +35,15 @@ export class ProjectsController {
     }
   }
 
+  @Post("pick-directory")
+  async pickDirectory() {
+    try {
+      return await this.projects.pickDirectory();
+    } catch (e) {
+      throw new InternalServerErrorException((e as Error).message);
+    }
+  }
+
   @Get(":slug")
   async getBySlug(@Param("slug") slug: string) {
     try {

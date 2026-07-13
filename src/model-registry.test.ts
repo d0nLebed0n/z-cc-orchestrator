@@ -23,14 +23,35 @@ describe("model-registry", () => {
   });
 
   it("reads existing models.yaml", async () => {
+    // review #38: api-модель обязана иметь provider+base_url (discriminated union).
     writeFileSync(
       join(dir, "models.yaml"),
-      `models:\n  - id: custom\n    label: Custom\n    kind: api\n    family: zai\nroles:\n  plan: custom\n  implement: custom\n  review: custom\n  refine: custom\n  fix: custom\n  final: custom\ncomplexity_threshold: 40\n`,
+      `models:\n  - id: custom\n    label: Custom\n    kind: api\n    family: zai\n    provider: anthropic\n    base_url: https://api.example.com\nroles:\n  plan: custom\n  implement: custom\n  review: custom\n  refine: custom\n  fix: custom\n  final: custom\ncomplexity_threshold: 40\n`,
     );
     const { loadModelsConfig } = await import("./model-registry.ts?t=" + Date.now());
     const cfg = loadModelsConfig(dir);
     expect(cfg.models[0]!.id).toBe("custom");
     expect(cfg.complexity_threshold).toBe(40);
+  });
+
+  // review #38 (review-2026-07-13): discriminated union в ModelInfoSchema.
+  // Раньше широкая schema пропускала api без provider/base_url и ollama без model.
+  it("rejects api model without provider/base_url (discriminated union)", async () => {
+    const { ModelInfoSchema } = await import("./model-config-dto.ts?t=" + Date.now());
+    expect(() => ModelInfoSchema.parse({ id: "x", label: "X", kind: "api", family: "zai" })).toThrow();
+    expect(() => ModelInfoSchema.parse({ id: "x", label: "X", kind: "api", family: "zai", provider: "anthropic" })).toThrow();
+  });
+
+  it("rejects ollama-http model without base_url/model (discriminated union)", async () => {
+    const { ModelInfoSchema } = await import("./model-config-dto.ts?t=" + Date.now());
+    expect(() => ModelInfoSchema.parse({ id: "x", label: "X", kind: "ollama-http", family: "local" })).toThrow();
+    expect(() => ModelInfoSchema.parse({ id: "x", label: "X", kind: "ollama-http", family: "local", base_url: "http://h:11434" })).toThrow();
+  });
+
+  it("accepts valid api and ollama models", async () => {
+    const { ModelInfoSchema } = await import("./model-config-dto.ts?t=" + Date.now());
+    expect(() => ModelInfoSchema.parse({ id: "x", label: "X", kind: "api", family: "zai", provider: "anthropic", base_url: "https://api.example.com" })).not.toThrow();
+    expect(() => ModelInfoSchema.parse({ id: "x", label: "X", kind: "ollama-http", family: "local", base_url: "http://h:11434", model: "qwen:30b" })).not.toThrow();
   });
 
   it("getSecret reads .secrets file", async () => {
@@ -59,6 +80,27 @@ describe("model-registry", () => {
     } finally {
       if (prevKey === undefined) delete process.env.GLM_API_KEY; else process.env.GLM_API_KEY = prevKey;
       if (prevUrl === undefined) delete process.env.GLM_BASE_URL; else process.env.GLM_BASE_URL = prevUrl;
+    }
+  });
+
+  it("migrates GLM_API_KEY when models.yaml already exists", async () => {
+    const prevKey = process.env.GLM_API_KEY;
+    delete process.env.GLM_API_KEY;
+    try {
+      const registry = await import("./model-registry.ts?t=" + Date.now());
+      registry.loadModelsConfig(dir);
+      registry.resetRegistry();
+
+      process.env.GLM_API_KEY = "sk-glm-after-models-seed";
+      registry.loadModelsConfig(dir);
+
+      expect(registry.getSecret("glm")).toBe("sk-glm-after-models-seed");
+      const { readFileSync } = await import("node:fs");
+      expect(readFileSync(join(dir, ".secrets"), "utf8")).toContain(
+        "glm=sk-glm-after-models-seed",
+      );
+    } finally {
+      if (prevKey === undefined) delete process.env.GLM_API_KEY; else process.env.GLM_API_KEY = prevKey;
     }
   });
 

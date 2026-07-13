@@ -5,6 +5,7 @@ node_modules/
 dist/
 docs/
 .next/
+*.tsbuildinfo
 
 # runtime blackboard (§4)
 .orchestrator/

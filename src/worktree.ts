@@ -52,14 +52,18 @@ export function integrationBranch(taskId: string): string {
 export async function setupIntegration(
   projectPath: string,
   taskId: string,
-  base = "main",
+  base?: string,
 ): Promise<{ branch: string; worktreePath: string }> {
   const branch = integrationBranch(taskId);
   const wtPath = await mkdtemp(join(tmpdir(), `orch-${taskId}-integration-`));
 
+  // review #8 (review-2026-07-13): детектить base вместо хардкода "main".
+  // Репо с master/develop/detached HEAD раньше падали на git branch <int> main.
+  const baseRef = base ?? (await detectBaseRef(projectPath));
+
   // Если integration-ветка уже есть — пересоздаём worktree на ней.
   try {
-    await git(projectPath, ["branch", branch, base]);
+    await git(projectPath, ["branch", branch, baseRef]);
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     if (!/already exists|exists/.test(msg)) throw e;
@@ -68,6 +72,24 @@ export async function setupIntegration(
   // worktree, отслеживающий integration-ветку (без --detach).
   await git(projectPath, ["worktree", "add", wtPath, branch]);
   return { branch, worktreePath: wtPath };
+}
+
+/**
+ * Детектнуть base ref для integration-ветки.
+ * review #8 (review-2026-07-13): репо может не иметь main (master/develop).
+ * 1. symbolic-ref --short HEAD → имя текущей ветки (напр. "master").
+ * 2. fallback на HEAD SHA (detached HEAD).
+ */
+export async function detectBaseRef(projectPath: string): Promise<string> {
+  try {
+    const { stdout } = await git(projectPath, ["symbolic-ref", "--short", "HEAD"]);
+    const ref = stdout.trim();
+    if (ref) return ref;
+  } catch {
+    // detached HEAD — symbolic-ref падает.
+  }
+  const { stdout: sha } = await git(projectPath, ["rev-parse", "HEAD"]);
+  return sha.trim();
 }
 
 /**
@@ -213,16 +235,19 @@ export async function removeIntegrationWorktree(
 export async function acceptTask(
   projectPath: string,
   taskId: string,
-  target = "main",
+  target?: string,
 ): Promise<{ ok: boolean; message: string }> {
+  // review #8 (review-2026-07-13): target по умолчанию — текущая ветка репо,
+  // а не хардкод "main" (машина с master/develop падала на merge --ff-only main).
+  const targetRef = target ?? (await detectBaseRef(projectPath));
   const integration = integrationBranch(taskId);
   try {
     // 1. fast-forward возможен?
     try {
-      await git(projectPath, ["merge-base", "--is-ancestor", target, integration]);
+      await git(projectPath, ["merge-base", "--is-ancestor", targetRef, integration]);
     } catch {
       throw new Error(
-        `not fast-forward: '${target}' is not an ancestor of '${integration}'. ` +
+        `not fast-forward: '${targetRef}' is not an ancestor of '${integration}'. ` +
           `Integration diverged — manual merge required.`,
       );
     }
@@ -232,19 +257,34 @@ export async function acceptTask(
     const current = curBranch.trim();
 
     // 3. если не на target — попробовать checkout (требует чистого WT)
-    if (current !== target) {
+    if (current !== targetRef) {
       try {
-        await git(projectPath, ["checkout", target]);
+        await git(projectPath, ["checkout", targetRef]);
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
         throw new Error(
-          `cannot checkout '${target}' (working tree dirty?). Clean or stash changes first.\n${msg}`,
+          `cannot checkout '${targetRef}' (working tree dirty?). Clean or stash changes first.\n${msg}`,
         );
       }
     }
 
     // 4. merge --ff-only
     const { stdout } = await git(projectPath, ["merge", "--ff-only", integration]);
+
+    // 5. Cleanup: удалить integration-ветку и её worktree (review #12).
+    //    Ранее cleanup был только в комментарии, но не выполнялся — ветки
+    //    orch/<id>/integration копились после каждого accept. Ошибка cleanup
+    //    НЕ отменяет уже выполненный merge (сообщение вернётся, но ok=true).
+    try {
+      await cleanupTask(projectPath, taskId);
+    } catch (cleanupErr) {
+      // Не перезаписываем успешный merge. Возвращаем ok=true, но с предупреждением.
+      const cleanupMsg = cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr);
+      return {
+        ok: true,
+        message: `${stdout}\n[warn: merge succeeded but cleanup failed: ${cleanupMsg}]`,
+      };
+    }
 
     return { ok: true, message: stdout };
   } catch (e) {
@@ -253,20 +293,73 @@ export async function acceptTask(
   }
 }
 
-/** Полный cleanup задачи: удалить integration-ветку и её worktree. */
+/**
+ * Полный cleanup задачи: удалить integration-ветку и её worktree.
+ *
+ * Если worktreePath не задан — ищем зарегистрированный worktree по ветке
+ * через `git worktree list` (after accept путь уже не у всех в памяти).
+ * Ошибки удаления логируем, но не бросаем — это best-effort cleanup.
+ *
+ * review #12: ранее был мёртвым кодом (defined but never called),
+ * integration-ветки и worktrees копились. Теперь вызывается из acceptTask
+ * и из точек терминального статуса в runner.
+ */
 export async function cleanupTask(
   projectPath: string,
   taskId: string,
   worktreePath?: string,
 ): Promise<void> {
-  if (worktreePath) {
-    await removeIntegrationWorktree(projectPath, worktreePath);
+  const branch = integrationBranch(taskId);
+  // 1. Найти и удалить worktree integration-ветки (если не передан явно).
+  let wtToRemove = worktreePath;
+  if (!wtToRemove) {
+    try {
+      wtToRemove = await findWorktreeForBranch(projectPath, branch);
+    } catch {
+      // best-effort
+    }
   }
+  if (wtToRemove) {
+    try {
+      await removeIntegrationWorktree(projectPath, wtToRemove);
+    } catch {
+      // ignore — ветка важнее
+    }
+  }
+  // 2. Подчистить административные записи worktrees (orphaned после rm -rf).
   try {
-    await git(projectPath, ["branch", "-D", integrationBranch(taskId)]);
+    await git(projectPath, ["worktree", "prune"]);
   } catch {
     // ignore
   }
+  // 3. Удалить integration-ветку.
+  try {
+    await git(projectPath, ["branch", "-D", branch]);
+  } catch {
+    // ignore — ветки может уже не быть (failed task без setupIntegration)
+  }
+}
+
+/**
+ * Найти путь worktree, который отслеживает данную ветку, через `git worktree list`.
+ * Возвращает undefined, если такого worktree нет.
+ */
+async function findWorktreeForBranch(
+  projectPath: string,
+  branch: string,
+): Promise<string | undefined> {
+  const { stdout } = await git(projectPath, ["worktree", "list", "--porcelain"]);
+  // Формат: блоки "worktree <path>\nHEAD <sha>\nbranch refs/heads/<branch>\n\n".
+  let curPath: string | undefined;
+  for (const line of stdout.split("\n")) {
+    if (line.startsWith("worktree ")) {
+      curPath = line.slice("worktree ".length).trim();
+    } else if (line.startsWith("branch ") && curPath) {
+      const ref = line.slice("branch ".length).trim();
+      if (ref === `refs/heads/${branch}` || ref === branch) return curPath;
+    }
+  }
+  return undefined;
 }
 
 // ─── Fan-out candidate lifecycle (Task 10, Phase B) ─────────────────────────

@@ -6,7 +6,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import type { TaskEnvelope } from "../envelope.ts";
 import type { WorkerFn, WorkerResult } from "./types.ts";
-import { parseToolCalls, executeTool } from "./ollama-tools.ts";
+import { parseToolCalls, executeTool, resolveRawPath } from "./ollama-tools.ts";
 import { truncate } from "./spawn.ts";
 
 const execFileAsync = promisify(execFile);
@@ -80,9 +80,16 @@ export function makeRunApiOpenAi(
     ];
 
     let lastAssistant = "";
+    // review #44: дедуп read_file того же пути подряд (зеркало runOllama).
+    // Без этого модель, застрявшая в «прочитай файл → снова прочитай тот же файл»,
+    // исчерпает maxIters и завершится budget_exhausted вместо полезной работы.
+    let lastReadPath: string | null = null;
     let httpOk = true;
     let timedOut = false;
     let iters = 0;
+    // completed = модель дала финальный ответ без tool calls (review #6).
+    let completed = false;
+    let budgetExhausted = false;
 
     while (iters < maxIters && Date.now() - start < wallMs) {
       iters++;
@@ -100,9 +107,21 @@ export function makeRunApiOpenAi(
       messages.push({ role: "assistant", content: reply });
 
       const calls = parseToolCalls(reply);
-      if (calls.length === 0) break;
+      if (calls.length === 0) {
+        completed = true;
+        break;
+      }
 
       for (const call of calls) {
+        // review #44: дедуп read_file того же пути подряд (как в runOllama).
+        if (call.name === "read_file") {
+          const rp = resolveRawPath(call);
+          if (rp === lastReadPath) {
+            messages.push({ role: "tool", content: "(already read, see above)" });
+            continue;
+          }
+          lastReadPath = rp;
+        }
         try {
           const result = await executeTool(call, opts.cwd);
           messages.push({ role: "tool", content: result });
@@ -112,6 +131,11 @@ export function makeRunApiOpenAi(
       }
     }
 
+    // Вышли по лимиту, но модель всё ещё зовёт tools — работа НЕ завершена.
+    if (!completed && httpOk) {
+      budgetExhausted = true;
+    }
+
     const output = truncate(lastAssistant.trim());
     const hasOutput = output.length > 0;
     const hasChanges = needsEdits ? await gitHasChanges(opts.cwd) : null;
@@ -119,6 +143,7 @@ export function makeRunApiOpenAi(
     const signals: WorkerResult["signals"] = [
       { name: "exit_0", ok: httpOk, detail: httpOk ? "http 200" : "http error" },
       { name: "nonempty_output", ok: hasOutput, detail: `${output.length} chars` },
+      { name: "completed", ok: completed, detail: completed ? "final answer" : "still calling tools" },
     ];
     if (needsEdits) {
       signals.push({ name: "files_changed", ok: hasChanges === true, detail: hasChanges ? "yes" : "no" });
@@ -127,6 +152,7 @@ export function makeRunApiOpenAi(
     let reason: WorkerResult["reason"] = null;
     if (timedOut) reason = "timeout";
     else if (!httpOk) reason = "error";
+    else if (budgetExhausted) reason = "budget_exhausted";
     else if (!hasOutput) reason = "no_output";
     else if (needsEdits && !hasChanges) reason = "no_changes";
 

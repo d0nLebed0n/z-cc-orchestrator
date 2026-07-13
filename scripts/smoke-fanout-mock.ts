@@ -25,6 +25,12 @@ import {
 } from "../src/worktree.ts";
 import { routeSubtask, pathsOverlap, buildLoadedWorkflow, WorkflowSchema } from "../src/workflow.ts";
 import type { Subtask } from "../src/plan.ts";
+import { loadModelsConfig } from "../src/model-registry.ts";
+import { BLACKBOARD_DIR } from "../src/blackboard.ts";
+
+// review #10: routeSubtask → getAgentFamily требует инициализированный registry.
+const regRoot = mkdtempSync(join(tmpdir(), "orch-smoke-fanout-"));
+loadModelsConfig(join(regRoot, BLACKBOARD_DIR));
 
 function assert(cond: boolean, msg: string): void {
   if (!cond) {
@@ -181,5 +187,6 @@ await removeIntegrationWorktree(root3, integration3.worktreePath);
 rmSync(root1, { recursive: true, force: true });
 rmSync(root2, { recursive: true, force: true });
 rmSync(root3, { recursive: true, force: true });
+rmSync(regRoot, { recursive: true, force: true });
 
 console.log("\nAll fan-out protocol checks passed.");

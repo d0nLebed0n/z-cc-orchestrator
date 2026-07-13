@@ -1,0 +1,42 @@
+name: refine
+description: |
+  Рефакторинг/улучшение: plan → refine → review → final.
+  Линейный (без цикла) — для одной итерации рефакторинга с финальной приёмкой.
+  Модели берутся из карты ролей Settings (role → model), а не хардкожены.
+steps:
+  - id: plan
+    role: plan
+    effort: high
+    budget:
+      wall_time_sec: 900
+      max_steps: 2
+    depends_on: []
+    target_paths: []
+
+  - id: refine
+    role: refine
+    effort: high
+    budget:
+      wall_time_sec: 1500
+      max_steps: 3
+    depends_on: [plan]
+    target_paths: []
+
+  - id: review
+    role: review
+    effort: high
+    budget:
+      wall_time_sec: 900
+      max_steps: 2
+      max_session_min: 25
+    depends_on: [refine]
+    target_paths: []
+
+  - id: final
+    role: final
+    effort: medium
+    budget:
+      wall_time_sec: 600
+      max_steps: 1
+    depends_on: [review]
+    target_paths: []

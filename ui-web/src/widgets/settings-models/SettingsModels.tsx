@@ -6,6 +6,26 @@ import type { ModelDto } from "@/entities";
 import { KIND_LABELS, FAMILY_LABELS } from "@/entities";
 import { AddModelModal } from "./AddModelModal";
 
+/** review #33: подпись статуса модели из backend statusOf. */
+function statusLabel(status: ModelDto["status"]): string {
+  switch (status) {
+    case "ready": return "● готов";
+    case "not_found": return "○ не найден";
+    case "missing_credentials": return "● нет ключа";
+    case "invalid_config": return "● неверный конфиг";
+    default: return "● неизвестно";
+  }
+}
+/** review #33: цвет статуса. ready — зелёный, ошибки — красный/жёлтый. */
+function statusColor(status: ModelDto["status"]): string {
+  switch (status) {
+    case "ready": return "#a6e3a1"; // зелёный
+    case "missing_credentials":
+    case "invalid_config": return "#f9e2af"; // жёлтый (недонастроено)
+    default: return "#f38ba8"; // красный (not_found / unknown)
+  }
+}
+
 const sectionStyle: React.CSSProperties = {
   background: "#181825",
   border: "1px solid #313244",
@@ -83,10 +103,11 @@ export function SettingsModels() {
               </div>
             </div>
             <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
-              <span style={{
-                fontSize: 12, color: m.status === "ready" ? "#a6e3a1" : "#f38ba8",
-              }}>
-                {m.status === "ready" ? "● готов" : m.status === "not_found" ? "○ не найден" : "● готов"}
+              {/* review #33 (review-2026-07-13): явные подписи для каждого статуса
+                  backend statusOf. Раньше unknown/missing_credentials/invalid_config
+                  рисовались как «● готов» (с красным цветом — противоречие). */}
+              <span style={{ fontSize: 12, color: statusColor(m.status) }}>
+                {statusLabel(m.status)}
               </span>
               <button
                 onClick={() => { setEditing(m); setModalOpen(true); }}

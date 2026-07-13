@@ -1,11 +1,11 @@
 name: default
 description: |
-  Базовый воркфлоу: glm имплементит → codex ревьюит.
+  Базовый воркфлоу: имплементация → ревью.
+  Модели берутся из карты ролей Settings (role → model), а не хардкожены.
+  Кросс-семейность enforced раннером: implement ≠ review по family.
   Если нужна правка по замечаниям review — используйте `agentic` (цикл).
-  Кросс-семейность: Z.ai(implement) → OpenAI(review).
 steps:
   - id: implement
-    agent: glm
     role: implement
     effort: medium
     budget:
@@ -15,7 +15,6 @@ steps:
     target_paths: []
 
   - id: review
-    agent: codex
     role: review
     effort: medium
     budget:

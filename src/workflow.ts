@@ -8,7 +8,10 @@
 import { z } from "zod";
 import { posix } from "node:path";
 import { getAgentFamily } from "./families.ts";
-import { getRoleMap } from "./model-registry.ts";
+import { getRoleMap, getModels } from "./model-registry.ts";
+import { logEvent } from "./blackboard.ts";
+import type { AgentMetrics } from "./agent-metrics.ts";
+import { scoreAgent } from "./agent-metrics.ts";
 import type { Family } from "./model-config-dto.ts";
 import type { Subtask } from "./plan.ts";
 
@@ -80,15 +83,15 @@ export const WorkflowSchema = z.object({
 )
 // fan_out consistency
 .refine(
-  (w) => w.steps.every((s) => !s.fan_out || (s.from_plan && s.agents && s.agents.length > 0)),
-  { message: "fan_out steps require from_plan and agents" },
+  (w) => w.steps.every((s) => !s.fan_out || s.from_plan),
+  { message: "fan_out steps require from_plan" },
 )
 .refine(
   (w) => {
     // Ревьюер для fan_out.review берётся из карты ролей (resolveRole("review"));
-    // раньше был захардкожен "codex". Исполнитель не должен совпадать с ревьюером.
+    // исполнитель не должен совпадать с ревьюером.
     const reviewer = getRoleMap().review;
-    return w.steps.every((s) => !s.fan_out || !s.review || !reviewer || !s.agents!.includes(reviewer));
+    return w.steps.every((s) => !s.fan_out || !s.review || !reviewer || !s.agents || !s.agents.includes(reviewer));
   },
   { message: "fan_out with review cannot list the review-role model in agents (it is the reviewer)" },
 )
@@ -119,6 +122,44 @@ export const WorkflowSchema = z.object({
 .refine(
   (w) => w.post_steps.every((s) => !s.fan_out),
   { message: "fan_out is not allowed in post_steps (only in pre-loop steps)" },
+)
+// review #4 (review-2026-07-13): уникальность id в каждой секции.
+.refine(
+  (w) => {
+    const sections = [w.steps, w.loop?.steps ?? [], w.post_steps];
+    return sections.every((sec) => {
+      const ids = sec.map((s) => s.id);
+      return new Set(ids).size === ids.length;
+    });
+  },
+  { message: "duplicate step id within a section (steps/loop.steps/post_steps)" },
+)
+// review #31 (review-2026-07-13): глобальная уникальность id по всем секциям.
+// Раньше одинаковый id в steps и post_steps проходил проверку, из-за чего
+// allSteps и поиск по id становились неоднозначными.
+.refine(
+  (w) => {
+    const all = [...w.steps, ...(w.loop?.steps ?? []), ...w.post_steps].map((s) => s.id);
+    return new Set(all).size === all.length;
+  },
+  { message: "duplicate step id across sections — step ids must be globally unique" },
+)
+// review #4: depends_on должно ссылаться на существующий id (в своей секции
+// или в steps — для loop/post_steps, чтобы зависеть от pre-loop шагов).
+.refine(
+  (w) => {
+    const allIds = new Set(w.steps.map((s) => s.id));
+    // depends_on внутри steps ссылаются только на steps.
+    const stepsOk = w.steps.every((s) => s.depends_on.every((dep) => allIds.has(dep)));
+    if (!stepsOk) return false;
+    // loop.steps / post_steps могут ссылаться на steps или свою секцию.
+    const loopIds = new Set(w.loop?.steps.map((s) => s.id) ?? []);
+    const postIds = new Set(w.post_steps.map((s) => s.id));
+    const loopOk = (w.loop?.steps ?? []).every((s) => s.depends_on.every((dep) => allIds.has(dep) || loopIds.has(dep)));
+    const postOk = w.post_steps.every((s) => s.depends_on.every((dep) => allIds.has(dep) || postIds.has(dep)));
+    return loopOk && postOk;
+  },
+  { message: "depends_on references unknown step id (typo?) — all deps must exist" },
 );
 export type Workflow = z.infer<typeof WorkflowSchema>;
 
@@ -166,6 +207,11 @@ export function topoLevels(steps: ResolvedStep[]): ResolvedStep[][] {
   while (done.size < steps.length) {
     const level = steps.filter((s) => {
       if (done.has(s.id)) return false;
+      // review #4 (review-2026-07-13): неизвестная зависимость (опечатка) ловится
+      // schema-валидатором. Но topoLevels вызывается на подмножестве шагов
+      // (prePlain / postFanOutPlain) — зависимость на fan_out-шаг или шаг из
+      // другой секции валидна, но этого шага нет в текущем наборе. Считаем её
+      // выполненной (она отрабатывает в другой фазе раннера).
       return s.depends_on.every((dep) => done.has(dep) || !byId.has(dep));
     });
     if (level.length === 0) {
@@ -177,16 +223,21 @@ export function topoLevels(steps: ResolvedStep[]): ResolvedStep[][] {
   return levels;
 }
 
-/** Проверить, что target_paths шагов в одном уровне не пересекаются (§4.5.2). */
+/**
+ * Проверить, что target_paths шагов в одном уровне не пересекаются (§4.5.2).
+ * review #30 (review-2026-07-13): используем pathsOverlap (видит parent/child),
+ * а не точный includes — иначе шаги с `paths:[src]` и `paths:[src/x.ts]`
+ * ошибочно проходят проверку и могут одновременно менять одни файлы.
+ */
 export function assertNonOverlappingPaths(level: ResolvedStep[]): void {
   for (let i = 0; i < level.length; i++) {
     for (let j = i + 1; j < level.length; j++) {
       const a = level[i]!;
       const b = level[j]!;
-      const overlap = a.target_paths.filter((p) => b.target_paths.includes(p));
-      if (overlap.length > 0) {
+      if (pathsOverlap(a.target_paths, b.target_paths)) {
         throw new Error(
-          `Steps ${a.id} and ${b.id} in same level have overlapping target_paths: ${overlap.join(", ")}. ` +
+          `Steps ${a.id} and ${b.id} in same level have overlapping target_paths ` +
+            `([${a.target_paths.join(", ")}] vs [${b.target_paths.join(", ")}]). ` +
             `Make them sequential (depends_on) or split paths.`,
         );
       }
@@ -246,6 +297,8 @@ export function orderLoopBody(steps: ResolvedStep[]): ResolvedStep[] {
   while (done.size < steps.length) {
     const ready = steps.filter((s) => {
       if (done.has(s.id)) return false;
+      // review #4: зависимость на шаг вне этого подмножества — валидна,
+      // выполняется в другой фазе. Опечатки ловит schema-валидатор.
       return s.depends_on.every((dep) => done.has(dep) || !byId.has(dep));
     });
     if (ready.length === 0) {
@@ -293,6 +346,87 @@ export function routeSubtask(subtask: Subtask, agents: string[], threshold: numb
     if (!strong && fam === "local") return a;
   }
   throw new Error(`routeSubtask: no agent for subtask ${subtask.id} (complexity ${subtask.complexity}, threshold ${threshold}, side=${strong ? "strong" : "local"}) in agents [${agents.join(",")}]`);
+}
+
+/**
+ * Метрики-aware маршрутизация (T3). Та же семантика, что у routeSubtask —
+ * threshold/complexity определяет сторону (strong vs local family), — но среди
+ * кандидатов нужной стороны выбирается агент с **минимальным score** (ниже = лучше:
+ * меньше error-rate, при равенстве — меньше latency).
+ *
+ * В отличие от routeSubtask (first-match), эта функция скорит всех кандидатов
+ * стороны и берёт лучшего. Решение логируется (kind: "route_decision") для
+ * воспроизводимости — видно в отчёте T2, почему выбран агент.
+ *
+ * @param logCtx taskId + root для logEvent. Если undefined — логирование отключено (тесты).
+ */
+export async function routeSubtaskWithMetrics(
+  subtask: Subtask,
+  agents: string[],
+  threshold: number,
+  metrics: AgentMetrics,
+  logCtx?: { taskId: string; root: string },
+): Promise<string> {
+  const strong = subtask.complexity >= threshold;
+  // Тот же базовый фильтр по стороне — семантика порога сохранена.
+  const candidates: string[] = [];
+  for (const a of agents) {
+    const fam = getAgentFamily(a);
+    if (!fam) throw new Error(`routeSubtaskWithMetrics: unknown model ${a}`);
+    if (strong && fam !== "local") candidates.push(a);
+    if (!strong && fam === "local") candidates.push(a);
+  }
+  if (candidates.length === 0) {
+    throw new Error(`routeSubtaskWithMetrics: no agent for subtask ${subtask.id} (complexity ${subtask.complexity}, threshold ${threshold}, side=${strong ? "strong" : "local"}) in agents [${agents.join(",")}]`);
+  }
+  // Один кандидат — без метрик (нечего выбирать).
+  if (candidates.length === 1) {
+    const chosen = candidates[0]!;
+    await logRouteDecision(logCtx, subtask.id, strong ? "strong" : "local", candidates, metrics, chosen);
+    return chosen;
+  }
+  // Несколько кандидатов — скорим, выбираем минимальный score.
+  let best = candidates[0]!;
+  let bestScore = scoreAgent(metrics.stats.get(best));
+  for (let i = 1; i < candidates.length; i++) {
+    const cand = candidates[i]!;
+    const score = scoreAgent(metrics.stats.get(cand));
+    if (score < bestScore) {
+      bestScore = score;
+      best = cand;
+    }
+  }
+  await logRouteDecision(logCtx, subtask.id, strong ? "strong" : "local", candidates, metrics, best);
+  return best;
+}
+
+/** Записать route_decision в log (для воспроизводимости и отчёта T2). */
+async function logRouteDecision(
+  logCtx: { taskId: string; root: string } | undefined,
+  subtaskId: string,
+  side: string,
+  candidates: string[],
+  metrics: AgentMetrics,
+  chosen: string,
+): Promise<void> {
+  if (!logCtx) return;
+  try {
+    await logEvent({
+      task_id: logCtx.taskId,
+      step_id: null,
+      level: "info",
+      kind: "route_decision",
+      message: `routed subtask ${subtaskId} (${side}) → ${chosen}`,
+      data: {
+        subtask: subtaskId,
+        side,
+        candidates: candidates.map((a) => ({ agent: a, score: scoreAgent(metrics.stats.get(a)) })),
+        chosen,
+      },
+    }, logCtx.root);
+  } catch {
+    // логирование — best-effort, не валить маршрутизацию
+  }
 }
 
 /** Раскрытие fan_out-шага: откуда брать план, кто исполняет, нужен ли codex-ревью. */
@@ -372,12 +506,31 @@ export function buildLoadedWorkflow(wf: Workflow): LoadedWorkflow {
   const plainSteps = allPre.filter((s) => !s.fan_out);
   const fanOutSteps = allPre.filter((s) => s.fan_out);
 
-  const fanOuts: FanOutSpec[] = fanOutSteps.map((s) => ({
-    step: s,
-    fromPlanId: s.from_plan!,
-    agents: s.agents!,
-    review: s.review,
-  }));
+  const fanOuts: FanOutSpec[] = fanOutSteps.map((s) => {
+    // review fan-out #workflow-roles: agents могут быть не заданы в YAML —
+    // тогда берём всех non-architect моделей из реестра (кроме review-роли),
+    // чтобы routeSubtask сам выбрал strong/local по threshold.
+    let agents = s.agents;
+    if (!agents || agents.length === 0) {
+      const roleMap = getRoleMap();
+      const reviewer = roleMap.review;
+      agents = getModels()
+        .filter((m) => m.id !== reviewer)
+        .map((m) => m.id);
+      if (agents.length === 0) {
+        throw new Error(
+          `fan_out step '${s.id}': no agents specified and registry has no candidates. ` +
+          `Set 'agents' in YAML or add models in Settings.`,
+        );
+      }
+    }
+    return {
+      step: s,
+      fromPlanId: s.from_plan!,
+      agents,
+      review: s.review,
+    };
+  });
   if (fanOuts.length > 1) {
     throw new Error("Only one fan_out step per workflow is supported (YAGNI)");
   }

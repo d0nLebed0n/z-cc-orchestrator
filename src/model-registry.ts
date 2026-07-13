@@ -1,5 +1,5 @@
-import { readFileSync, writeFileSync, existsSync } from "node:fs";
-import { join } from "node:path";
+import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
+import { join, dirname } from "node:path";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import {
   ModelsConfigSchema,
@@ -52,7 +52,6 @@ let secretsCache: Map<string, string> | null = null;
  */
 export function loadModelsConfig(dir: string): ModelsConfig {
   const modelsPath = join(dir, "models.yaml");
-  let modelsSeeded = false;
   if (existsSync(modelsPath)) {
     const raw = readFileSync(modelsPath, "utf8");
     const parsed = ModelsConfigSchema.parse(parseYaml(raw));
@@ -60,6 +59,7 @@ export function loadModelsConfig(dir: string): ModelsConfig {
     // Миграция: добавить роль architect, если её нет (новая роль с этого коммита).
     if (!cached.roles.architect) {
       cached.roles.architect = "claude";
+      mkdirSync(dirname(modelsPath), { recursive: true });
       writeFileSync(modelsPath, stringifyYaml(cached), "utf8");
     }
   } else {
@@ -70,31 +70,35 @@ export function loadModelsConfig(dir: string): ModelsConfig {
       const glmModel = cached.models.find((m) => m.id === "glm");
       if (glmModel) glmModel.base_url = process.env.GLM_BASE_URL;
     }
+    // .orchestrator/ может не существовать в чужом проекте — создаём.
+    mkdirSync(dirname(modelsPath), { recursive: true });
     writeFileSync(modelsPath, stringifyYaml(cached), "utf8");
-    modelsSeeded = true;
   }
   // Секреты: читаем всегда (могут измениться).
   const secretsPath = join(dir, ".secrets");
   const secretsExisted = existsSync(secretsPath);
+  let secretsRaw = "";
   secretsCache = new Map();
   if (secretsExisted) {
-    const raw = readFileSync(secretsPath, "utf8");
-    for (const line of raw.split("\n")) {
+    secretsRaw = readFileSync(secretsPath, "utf8");
+    for (const line of secretsRaw.split("\n")) {
       const eq = line.indexOf("=");
       if (eq > 0) {
         secretsCache.set(line.slice(0, eq).trim(), line.slice(eq + 1).trim());
       }
     }
-  } else if (modelsSeeded) {
-    // One-time миграция (PLAN §6): при первичном сидинге .secrets — забираем
-    // GLM_API_KEY из окружения (.env.local), чтобы существующие пользователи
-    // не сломались при апгрейде. Выполняется только когда models.yaml только что
-    // посажен (т.е. это настоящий первый запуск).
-    const glmKey = process.env.GLM_API_KEY;
-    if (glmKey) {
-      secretsCache.set("glm", glmKey);
-      writeFileSync(secretsPath, `glm=${glmKey}\n`, "utf8");
-    }
+  }
+
+  // Миграция (PLAN §6): если GLM_API_KEY ещё не перенесён, забираем его из
+  // окружения (.env.local). models.yaml мог быть создан раньше без .secrets,
+  // поэтому миграция не должна зависеть от первичного сидинга реестра.
+  const glmKey = process.env.GLM_API_KEY;
+  if (glmKey && !secretsCache.has("glm")) {
+    secretsCache.set("glm", glmKey);
+    const prefix = secretsRaw.length === 0 || secretsRaw.endsWith("\n")
+      ? secretsRaw
+      : `${secretsRaw}\n`;
+    writeFileSync(secretsPath, `${prefix}glm=${glmKey}\n`, { encoding: "utf8", mode: 0o600 });
   }
   return cached;
 }

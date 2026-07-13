@@ -1,11 +1,11 @@
 name: quick
 description: |
-  Дёшево, для тривиальной рутины: только GLM-имплемент, без ревью.
+  Дёшево, для тривиальной рутины: только implement, без ревью.
+  Модели берутся из карты ролей Settings (role → model), а не хардкожены.
   ⚠️ Результат НЕ идёт в main без ручной проверки (раннер помечает ветку
-  needs-human-review). PLAN §3.2.
+  needs-human-review).
 steps:
   - id: implement
-    agent: glm
     role: implement
     effort: low
     budget:

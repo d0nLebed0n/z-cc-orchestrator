@@ -6,7 +6,14 @@
  */
 import type { TaskEnvelope } from "../envelope.ts";
 
-export type WorkerExitReason = "ok" | "timeout" | "nonzero_exit" | "no_output" | "no_changes" | "error";
+export type WorkerExitReason =
+  | "ok"
+  | "timeout"
+  | "budget_exhausted" // tool-loop вышел по лимиту итераций/wall-time, всё ещё зовёт tools (review #6)
+  | "nonzero_exit"
+  | "no_output"
+  | "no_changes"
+  | "error";
 
 export interface WorkerResult {
   /** Совпал ли exit-код с ожидаемым (0). */

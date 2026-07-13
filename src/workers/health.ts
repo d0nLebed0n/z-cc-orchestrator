@@ -275,8 +275,15 @@ async function checkOllamaHealth(
   });
 
   if (hasUrl) {
+    // review #36 (review-2026-07-13): таймаут как у checkApiOpenAiHealth.
+    // Раньше зависший сокет (напр. недоступный Tailscale-хост) бессрочно
+    // удерживал --health и обязательный health-gate перед запуском.
+    // Нормализуем base URL: убираем trailing slash (double slash в /api/tags).
+    const base = baseUrl.replace(/\/$/, "");
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 15000);
     try {
-      const res = await fetch(`${baseUrl}/api/tags`, { method: "GET" });
+      const res = await fetch(`${base}/api/tags`, { method: "GET", signal: ctrl.signal });
       const ok = res.ok;
       let detail = `HTTP ${res.status}`;
       if (ok) {
@@ -294,11 +301,14 @@ async function checkOllamaHealth(
       }
       checks.push({ name: "reachable", ok, detail });
     } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
       checks.push({
         name: "reachable",
         ok: false,
-        detail: e instanceof Error ? e.message : String(e),
+        detail: /aborted|timeout/i.test(msg) ? `timeout (15s) reaching ${base}` : msg,
       });
+    } finally {
+      clearTimeout(timer);
     }
   }
 

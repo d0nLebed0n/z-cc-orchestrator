@@ -3,12 +3,23 @@
  * нативный tool_calls — она встраивает <tools>{...}</tools> в content.
  * Парсим этот текстовый протокол, исполняем относительно worktree (cwd).
  */
-import { readFile, writeFile, readdir, mkdir } from "node:fs/promises";
-import { isAbsolute, join, normalize, relative } from "node:path";
+import { readFile, writeFile, readdir, mkdir, lstat, realpath } from "node:fs/promises";
+import { isAbsolute, join, normalize, relative, dirname } from "node:path";
 
 export interface ToolCall {
   name: "read_file" | "write_file" | "list_dir" | string;
   args: Record<string, string>;
+}
+
+/**
+ * Нормализовать path-аргумент tool-вызова из любого из алиасов, которые
+ * выдают модели (path | file_path | filepath | file_name).
+ * review #45 (review-2026-07-13): дедуп read_file в воркерах должен использовать
+ * ту же нормализацию, что executeTool — иначе read_file через file_path после
+ * read_file через path не дедуплицируется.
+ */
+export function resolveRawPath(call: ToolCall): string {
+  return call.args.path ?? call.args.file_path ?? call.args.filepath ?? call.args.file_name ?? "";
 }
 
 /**
@@ -172,23 +183,103 @@ function asToolCall(obj: unknown): ToolCall | null {
   return { name: o.name, args };
 }
 
-/** Защищённое разрешение пути: относительный к cwd; reject выхода за cwd. */
-export function sanitizePath(cwd: string, p: string): string {
-  const abs = isAbsolute(p) ? normalize(p) : normalize(join(cwd, p));
-  const rel = relative(cwd, abs);
+/**
+ * Защищённое разрешение пути: относительный к cwd; reject выхода за cwd.
+ *
+ * Лексическая проверка (normalize/relative) НЕ достаточна: symlink внутри
+ * worktree может указывать наружу (напр. worktree/config → ~/.ssh/config), и
+ *单纯的 lexical check пропустит его (review #2). Поэтому:
+ *   - канонизируем корень worktree через realpath (разрешает symlink-корень);
+ *   - для существующей цели проверяем её realpath — он должен оставаться внутри корня;
+ *   - для нового файла проверяем realpath ближайшего существующего родителя;
+ *   - дополнительно отклоняем symlink-компоненту в самом пути через lstat
+ *     (защита от symlink-to-dir, чей realpath формально под корнем на момент проверки).
+ */
+export async function sanitizePath(cwd: string, p: string): Promise<string> {
+  // Канонический корень worktree (разрешает symlink, напр. /tmp → /private/tmp на macOS).
+  const rootReal = await realpath(cwd);
+
+  const abs = isAbsolute(p) ? normalize(p) : normalize(join(rootReal, p));
+  const rel = relative(rootReal, abs);
   if (rel.startsWith("..") || isAbsolute(rel)) {
-    throw new Error(`path '${p}' escapes worktree root ${cwd}`);
+    throw new Error(`path '${p}' escapes worktree root ${rootReal}`);
+  }
+
+  // Отклонить любую symlink-компоненту внутри worktree (не даём следовать наружу).
+  // Проверяем каждый родительский сегмент от корня до целевого пути через lstat.
+  await assertNoSymlinkIn(rootReal, abs);
+
+  // Для существующей цели — её realpath должен оставаться внутри корня
+  // (защита от symlink, чья ссылка ведёт наружу).
+  try {
+    const targetReal = await realpath(abs);
+    const targetRel = relative(rootReal, targetReal);
+    if (targetRel.startsWith("..") || isAbsolute(targetRel)) {
+      throw new Error(`path '${p}' resolves outside worktree root via symlink`);
+    }
+  } catch (e) {
+    // ENOENT — целевой файл ещё не существует (write_file нового файла).
+    // Проверяем ближайший существующий родитель: если он — symlink наружу, отвергаем.
+    const code = (e as NodeJS.ErrnoException).code;
+    if (code !== "ENOENT") throw e;
+    await assertParentInsideRoot(abs, rootReal, p);
   }
   return abs;
 }
 
+/** Проверить, что ни один сегмент от root до abs не является symlink. */
+async function assertNoSymlinkIn(root: string, abs: string): Promise<void> {
+  // От root (включительно) до родителя abs. Сам abs может быть ещё не существующим.
+  const segments = abs.slice(root.length).split("/").filter(Boolean);
+  let cur = root;
+  for (const seg of segments) {
+    cur = join(cur, seg);
+    let st: Awaited<ReturnType<typeof lstat>>;
+    try {
+      st = await lstat(cur);
+    } catch (e) {
+      const code = (e as NodeJS.ErrnoException).code;
+      if (code === "ENOENT") return; // дальше пути не существует — ок для нового файла
+      throw e;
+    }
+    if (st.isSymbolicLink()) {
+      throw new Error(`path component '${cur}' is a symlink — refused`);
+    }
+  }
+}
+
+/** Для несуществующей цели: realpath ближайшего существующего родителя внутри root. */
+async function assertParentInsideRoot(abs: string, root: string, orig: string): Promise<void> {
+  let dir = dirname(abs);
+  for (let i = 0; i < 32 && dir !== root && dir !== "/"; i++) {
+    try {
+      const parentReal = await realpath(dir);
+      const rel = relative(root, parentReal);
+      if (rel.startsWith("..") || isAbsolute(rel)) {
+        throw new Error(`path '${orig}' resolves outside worktree root via symlink`);
+      }
+      return; // нашли существующего родителя, он внутри root
+    } catch (e) {
+      const code = (e as NodeJS.ErrnoException).code;
+      if (code !== "ENOENT") throw e;
+      dir = dirname(dir);
+    }
+  }
+}
+
 /** Исполнить один tool-вызов. Возвращает текст-результат для истории диалога. */
 export async function executeTool(call: ToolCall, cwd: string): Promise<string> {
-  // Модель использует path | file_path | filepath | file_name — нормализуем.
-  const rawPath = call.args.path ?? call.args.file_path ?? call.args.filepath ?? call.args.file_name;
+  // review #45: нормализация path-алиасов вынесена в resolveRawPath (общий хелпер
+  // для executeTool и дедупа read_file в воркерах).
+  const rawPath = resolveRawPath(call);
   switch (call.name) {
     case "read_file": {
-      const path = sanitizePath(cwd, String(rawPath ?? ""));
+      let path: string;
+      try {
+        path = await sanitizePath(cwd, String(rawPath ?? ""));
+      } catch (e) {
+        return `(error reading ${rawPath}: ${e instanceof Error ? e.message : e})`;
+      }
       try {
         return await readFile(path, "utf8");
       } catch (e) {
@@ -196,13 +287,23 @@ export async function executeTool(call: ToolCall, cwd: string): Promise<string> 
       }
     }
     case "write_file": {
-      const path = sanitizePath(cwd, String(rawPath ?? ""));
+      let path: string;
+      try {
+        path = await sanitizePath(cwd, String(rawPath ?? ""));
+      } catch (e) {
+        return `(error writing ${rawPath}: ${e instanceof Error ? e.message : e})`;
+      }
       await mkdir(join(path, ".."), { recursive: true }).catch(() => {});
       await writeFile(path, String(call.args.content ?? ""), "utf8");
       return `(wrote ${rawPath}, ${String(call.args.content ?? "").length} bytes)`;
     }
     case "list_dir": {
-      const path = sanitizePath(cwd, String(rawPath ?? "."));
+      let path: string;
+      try {
+        path = await sanitizePath(cwd, String(rawPath ?? "."));
+      } catch (e) {
+        return `(error listing ${rawPath}: ${e instanceof Error ? e.message : e})`;
+      }
       try {
         const entries = await readdir(path, { withFileTypes: true });
         return entries.map((e) => `${e.isDirectory() ? "[dir]" : "[file]"} ${e.name}`).join("\n");

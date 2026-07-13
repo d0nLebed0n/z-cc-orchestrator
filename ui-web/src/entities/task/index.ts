@@ -49,3 +49,5 @@ export function stepProgress(task: TaskRecord): { ok: number; total: number } {
 export function workflowName(task: TaskRecord): string {
   return task.workflow.split("/").pop()?.replace(/\.ya?ml$/, "") ?? task.workflow;
 }
+
+export * from "./result";

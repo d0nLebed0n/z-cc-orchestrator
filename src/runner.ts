@@ -12,13 +12,14 @@ import {
   WorkflowSchema,
   buildLoadedWorkflow,
   routeSubtask,
+  routeSubtaskWithMetrics,
   pathsOverlap,
   type ResolvedStep,
   type LoadedWorkflow,
   type FanOutSpec,
 } from "./workflow.ts";
 import { getAgentFamily, pickReviewer } from "./families.ts";
-import { resolveRole } from "./model-registry.ts";
+import { resolveRole, getModel } from "./model-registry.ts";
 import { parsePlan, type Subtask, type SubtaskPlan } from "./plan.ts";
 import { makeEnvelope, type TaskEnvelope } from "./envelope.ts";
 import { dispatchWorker, type WorkerResult, type WorkerRunOptions } from "./workers/index.ts";
@@ -33,6 +34,7 @@ import {
   getTask,
   type StepRecord,
   type TaskRecord,
+  type StepSource,
 } from "./blackboard.ts";
 import {
   newBudgetState,
@@ -61,6 +63,13 @@ import { checkHealthForAgents, formatHealthReport } from "./workers/health.ts";
 import { slugFromPath } from "./project-knowledge/slug.ts";
 import { loadProjectContextCache, buildProjectContext } from "./project-knowledge/context.ts";
 import { archiveTask } from "./project-knowledge/archive.ts";
+import { recordTaskMemory } from "./project-knowledge/memory-extract.ts";
+import { searchNodes, projectIdFromPath } from "./project-knowledge/memory-store.ts";
+import { cacheKey, readCache, writeCache, applyPatch, captureRepoFingerprint } from "./cache.ts";
+import { generateReport, writeReport } from "./report.ts";
+import { loadAgentMetrics, type AgentMetrics } from "./agent-metrics.ts";
+
+import { acquireRunLock } from "./lib/run-lock.ts";
 
 /** Ограниченный пул конкурентности: не больше maxParallel одновременно. Сохраняет порядок результатов. */
 export async function runBounded<T, U>(
@@ -88,6 +97,12 @@ export interface RunOptions {
   project: string;
   /** Лимит параллельных воркеров (PLAN §5: потолок 3). */
   maxParallel?: number;
+  /** Отключить кэш ответов агентов (T1). true = всегда звать реального агента. */
+  noCache?: boolean;
+  /** TTL записи кэша в секундах (T1). undefined = бессрочно. */
+  cacheTtlSec?: number;
+  /** T3: отключить метрики-aware роутинг fan-out (fallback на статический threshold). */
+  noSmartRouting?: boolean;
 }
 
 export interface RunResult {
@@ -182,6 +197,12 @@ interface WorkerOnlyOpts {
   ctxCache?: Map<string, string>;
   /** Текущий active-task (строка markdown, из переменной в runWorkflow). */
   activeTask?: string | null;
+  /** Отключить кэш ответов агентов (T1). true = всегда звать реального агента. */
+  noCache?: boolean;
+  /** TTL записи кэша в секундах (T1). undefined = бессрочно. */
+  cacheTtlSec?: number;
+  /** review #3 (T1-T5): root blackboard (state.json/cache/) — process.cwd() оркестратора. */
+  blackboardRoot?: string;
 }
 
 /**
@@ -246,8 +267,23 @@ async function runWorkerOnly(
   // Для plan-шага, питающего fan_out, требуем строгий JSON SubtaskPlan.
   const fanOutPlan = o.fanOut ?? (step.role === "plan" && allSteps.some((s) => s.fan_out && s.from_plan === step.id));
   // Инъекция контекста проекта (для architect — null, он получает live-скан).
+  // T4: для plan-шага — top-N релевантных фактов из памяти проекта (knowledge.db).
+  let pastFacts: string | null = null;
+  if (o.ctxCache && step.role === "plan") {
+    try {
+      const pid = projectIdFromPath(projectPath);
+      const nodes = searchNodes(pid, prompt, 5);
+      if (nodes.length > 0) {
+        pastFacts = nodes
+          .map((n) => `- [${n.type}] (task ${n.task_id}): ${n.content}`)
+          .join("\n");
+      }
+    } catch {
+      // memory DB недоступна — деградируем без past facts
+    }
+  }
   const projectContext = o.ctxCache
-    ? buildProjectContext(step.role, o.ctxCache, o.activeTask ?? null)
+    ? buildProjectContext(step.role, o.ctxCache, o.activeTask ?? null, pastFacts)
     : null;
   const fullPrompt = buildWorkerPrompt({
     role: step.role,
@@ -317,12 +353,64 @@ async function runWorkerOnly(
     attempts: 1,
     result_path: null,
     error: null,
+    source: "worker", // review New#2 (T1-T5): маркер источника; "cache" при cache hit
   };
   await upsertStep(taskId, record);
 
   const budget = newBudgetState(stepId);
   let result: WorkerResult;
+  // T1: кэш ответов агентов. Попытка cache hit ДО реального dispatch.
+  // На hit — replay правок (patch) в worktree; на miss — штатный dispatch + ретраи.
+  // Ошибки кэша — best-effort: любой throw/miss = идём к реальному агенту.
+  let fromCache = false;
+  const cacheEnabled = !o.noCache;
+  let cacheKeyHash: string | null = null;
+  // cachedResult держит hit-результат (или null). result присваивается один раз ниже,
+  // чтобы TS мог доказать definite assignment.
+  let cachedResult: WorkerResult | null = null;
+  if (cacheEnabled) {
+    try {
+      const model = getModel(envelope.agent);
+      if (model) {
+        // review #5 (review-2026-07-13): fingerprint для ВСЕХ ролей.
+        // Editing — из worktree (wt.path); read-only (plan/review/final) — из cwd
+        // (integration worktree или projectPath), т.к. они читают код оттуда.
+        const fpCwd = wt ? wt.path : cwd;
+        const repoFingerprint = await captureRepoFingerprint(fpCwd);
+        cacheKeyHash = cacheKey(envelope, model, repoFingerprint);
+        const entry = await readCache(cacheKeyHash, { ttlSec: o.cacheTtlSec, root: o.blackboardRoot ?? projectPath });
+        if (entry) {
+          // Для editing-роли с patch — replay в worktree. Проверяем baseSha
+          // (patch относится к конкретной версии кода). Если не лёг — miss.
+          if (entry.patch && wt) {
+            const applied = await applyPatch(entry.patch, wt.path, entry.base_sha);
+            if (applied) {
+              cachedResult = entry.result;
+            }
+          } else {
+            // read-only роль или нет правок — result целиком из кэша.
+            cachedResult = entry.result;
+          }
+          if (cachedResult) {
+            fromCache = true;
+            record.attempts = 1;
+            record.source = "cache" satisfies StepSource;
+            await logEvent({
+              task_id: taskId, step_id: stepId, level: "info",
+              kind: "cache_hit", message: `cache hit for ${step.agent}/${step.role}`,
+              data: { source: "cache" satisfies StepSource },
+            });
+          }
+        }
+      }
+    } catch {
+      // любая ошибка кэша = miss, не валит задачу
+    }
+  }
   try {
+    if (cachedResult) {
+      result = cachedResult;
+    } else {
     result = await dispatchWorker(step.agent, envelope, workerOpts);
     const consumed = consumeBudget(budget, envelope, result);
     record.attempts = consumed.attempts;
@@ -344,6 +432,7 @@ async function runWorkerOnly(
       result = retryResult;
       record.attempts = cur.attempts;
     }
+    } // end else (cache miss)
 
     // Записать результат в blackboard (sidecar, §2.5 сигнал #3 для codex)
     const resultPath = await writeResult(taskId, stepId, {
@@ -358,6 +447,51 @@ async function runWorkerOnly(
       timed_out: result.timed_out,
     });
     record.result_path = resultPath;
+
+    // T1: на cache miss при успешном результате — снять patch правок и записать в кэш.
+    // Patch снимается с worktree ДО removeWorktree (он в runStep/runFanOut позже).
+    // read-only роли (wt === null) записываются с patch=null.
+    // review #1/#2 (T1-T5): patch включает baseSha (для проверки при replay) и
+    // untracked-файлы (через git add -A + diff --cached, иначе новые файлы теряются).
+    if (!fromCache && cacheEnabled && result.success && cacheKeyHash) {
+      try {
+        let patch: string | null = null;
+        let baseSha: string | null = null;
+        let dirtyFingerprint: string | null = null;
+        if (wt) {
+          // Снять fingerprint (baseSha + dirty) — он уже мог быть снят выше, но
+          // перевызываем безопасно (между вызовом и now код мог измениться).
+          const fp = await captureRepoFingerprint(wt.path);
+          baseSha = fp?.baseSha ?? null;
+          dirtyFingerprint = fp?.dirtyFingerprint ?? null;
+          // Включить untracked: stage всё во временный index, снять diff, unstage.
+          // git add -A НЕ меняет working tree, только index. reset --soft (?) —
+          // используем `git reset` (mixed, по умолчанию) чтобы очистить index,
+          // оставив working tree нетронутым.
+          await git(wt.path, ["add", "-A"]);
+          const { stdout } = await git(wt.path, ["diff", "--cached"]);
+          patch = stdout.trim() || null;
+          // Unstage — вернуть index к HEAD, не трогая working tree.
+          await git(wt.path, ["reset", "--mixed", "HEAD"]).catch(() => {});
+        }
+        await writeCache(
+          {
+            hash: cacheKeyHash,
+            agent: envelope.agent,
+            role: envelope.role,
+            result,
+            patch,
+            base_sha: baseSha,
+            dirty_fingerprint: dirtyFingerprint,
+            created_at: new Date().toISOString(),
+            model_tag: getModel(envelope.agent)?.model ?? "",
+          },
+          o.blackboardRoot ?? projectPath,
+        );
+      } catch {
+        // запись в кэш — best-effort
+      }
+    }
 
     // Checkpoint для codex (§4.3) — раннер пишет digest
     if (step.agent === "codex") {
@@ -438,6 +572,12 @@ async function runStep(
   ctxCache?: Map<string, string>,
   /** Текущий active-task (строка markdown, из переменной в runWorkflow). */
   activeTask?: string | null,
+  /** T1: отключить кэш ответов агентов. */
+  noCache?: boolean,
+  /** T1: TTL записи кэша (сек). */
+  cacheTtlSec?: number,
+  /** review #3 (T1-T5): root blackboard. */
+  blackboardRoot?: string,
 ): Promise<StepRun> {
   // review/final: работают в integration-worktree, где виден смерженный код
   //  (иначе reviewer смотрит на пустой main и не видит работу implementer-а).
@@ -465,7 +605,7 @@ async function runStep(
     projectPath,
     breaker,
     allSteps,
-    { iteration, cwdOverride, contextOverride: ctx, ctxCache, activeTask },
+    { iteration, cwdOverride, contextOverride: ctx, ctxCache, activeTask, noCache, cacheTtlSec, blackboardRoot },
   );
 
   // Merge worktree в integration после успеха (только для editing-ролей — у
@@ -543,6 +683,14 @@ async function runFanOut(
   maxParallel: number,
   ctxCache?: Map<string, string>,
   activeTask?: string | null,
+  /** T1: отключить кэш ответов агентов. */
+  noCache?: boolean,
+  /** T1: TTL записи кэша (сек). */
+  cacheTtlSec?: number,
+  /** review #3 (T1-T5): root blackboard (state.json/cache/) — process.cwd() оркестратора. */
+  blackboardRoot?: string,
+  /** T3: per-agent метрики для smart-роутинга. undefined = static routing. */
+  agentMetrics?: AgentMetrics,
 ): Promise<FanOutOutcome> {
   const stepIdx = allSteps.indexOf(spec.step);
   const planStepIdx = allSteps.findIndex((s) => s.id === spec.fromPlanId);
@@ -571,7 +719,10 @@ async function runFanOut(
   const failed: string[] = [];
   for (const subtask of plan.subtasks) {
     try {
-      const agent = routeSubtask(subtask, spec.agents, threshold);
+      // T3: метрики-aware роутинг, если есть agentMetrics. Иначе — статический threshold.
+      const agent = agentMetrics
+        ? await routeSubtaskWithMetrics(subtask, spec.agents, threshold, agentMetrics, { taskId, root: projectPath })
+        : routeSubtask(subtask, spec.agents, threshold);
       routed.push({ subtask, agent });
     } catch (e) {
       failed.push(subtask.id);
@@ -630,7 +781,7 @@ async function runFanOut(
       taskId, implStep, stepIdx,
       `${subtask.goal}\n\nACCEPTANCE CRITERIA: ${subtask.acceptance_criteria}`,
       projectPath, breaker, allSteps,
-      { subtaskSuffix: `~${subtask.id}`, ctxCache, activeTask },
+      { subtaskSuffix: `~${subtask.id}`, ctxCache, activeTask, noCache, cacheTtlSec, blackboardRoot },
     );
     // Коммитим правки в implement-ветку (чтобы они ушли в merge на Phase B), но НЕ мержим.
     if (wt && result.success) {
@@ -712,7 +863,7 @@ async function runFanOut(
     const rr = await runWorkerOnly(
       taskId, reviewStep, stepIdx, buildReviewPrompt(item.subtask),
       projectPath, breaker, allSteps,
-      { subtaskSuffix: `~${item.subtask.id}r`, cwdOverride: candidate.worktreePath, skipWorktree: true, ctxCache, activeTask },
+      { subtaskSuffix: `~${item.subtask.id}r`, cwdOverride: candidate.worktreePath, skipWorktree: true, ctxCache, activeTask, noCache, cacheTtlSec, blackboardRoot },
     );
     const verdict = await parseVerdict(taskId, rr.stepId);
     if (verdict === "APPROVE" || verdict === "ACCEPT") {
@@ -843,6 +994,31 @@ export async function runWorkflow(opts: RunOptions): Promise<RunResult> {
   const loaded = await loadWorkflow(opts.workflowPath);
   const { preLevels, postFanOutLevels, loopBody, loop, postLevels, allSteps, fanOuts } = loaded;
   const projectPath = opts.project;
+  // review #3 (T1-T5): blackboard (state.json, results/, cache/, logs/) живёт в
+  // process.cwd() оркестратора, а НЕ в target project (для --project <ext path>).
+  // cache, metrics, report, memory — все читают/пишут blackboard через этот root.
+  const blackboardRoot = process.cwd();
+  // review #7 (review-2026-07-13): global run lock — единая точка для CLI,
+  // backend, MCP. Без этого два процесса могли одновременно write state.json.
+  // review #25: acquireRunLock стал async (atomic open wx). Весь последующий
+  // код тела функции оборачивается во внешний try/finally ниже, чтобы любое
+  // исключение (health gate, preflight, создание задачи) освобождало lock.
+  const runLock = await acquireRunLock(blackboardRoot);
+  try {
+    return await runWorkflowBody(opts, loaded, blackboardRoot);
+  } finally {
+    runLock.release();
+  }
+}
+
+/** Тело runWorkflow, вынесено чтобы lock гарантированно освобождалось (review #25). */
+async function runWorkflowBody(
+  opts: RunOptions,
+  loaded: LoadedWorkflow,
+  blackboardRoot: string,
+): Promise<RunResult> {
+  const { preLevels, postFanOutLevels, loopBody, loop, postLevels, allSteps, fanOuts } = loaded;
+  const projectPath = opts.project;
   // effectiveMaxParallel (point #7): opts.maxParallel ?? wf.max_parallel ?? 3.
   const effectiveMaxParallel = opts.maxParallel ?? loaded.wf.max_parallel ?? 3;
   const threshold = loaded.wf.complexity_threshold;
@@ -967,12 +1143,12 @@ export async function runWorkflow(opts: RunOptions): Promise<RunResult> {
       // Promise.all(level.map(...)) запускал бы весь уровень разом, игнорируя
       // effectiveMaxParallel. runBounded сохраняет порядок результатов.
       const results = await runBounded(level, concurrency, (step) =>
-        runStep(task.id, step, allSteps.indexOf(step), opts.prompt, projectPath, integrationWtPath, breaker, allSteps, 1, undefined, ctxCache, activeTask),
+        runStep(task.id, step, allSteps.indexOf(step), opts.prompt, projectPath, integrationWtPath, breaker, allSteps, 1, undefined, ctxCache, activeTask, opts.noCache, opts.cacheTtlSec, blackboardRoot),
       );
       if (!results.every((r) => r.result.success)) overallSuccess = false;
     } else {
       for (const step of level) {
-        const r = await runStep(task.id, step, allSteps.indexOf(step), opts.prompt, projectPath, integrationWtPath, breaker, allSteps, 1, undefined, ctxCache, activeTask);
+        const r = await runStep(task.id, step, allSteps.indexOf(step), opts.prompt, projectPath, integrationWtPath, breaker, allSteps, 1, undefined, ctxCache, activeTask, opts.noCache, opts.cacheTtlSec, blackboardRoot);
         if (!r.result.success) {
           overallSuccess = false;
           break; // На последовательном уровне — не продолжаем после провала (HITL).
@@ -986,12 +1162,22 @@ export async function runWorkflow(opts: RunOptions): Promise<RunResult> {
   // point #1: Phase A (parallel implement) + Phase B (sequential candidate merge).
   // plan-шаг (fromPlanId) уже исполнен в preLevels; читаем его результат внутри runFanOut.
   if (overallSuccess && fanOuts.length > 0) {
+    // T3: загрузить per-agent метрики один раз для smart-роутинга всех fan-out'ов.
+    // Один read state.json; только когда smart-routing включён.
+    let agentMetrics: AgentMetrics | undefined;
+    if (!opts.noSmartRouting) {
+      try {
+        agentMetrics = await loadAgentMetrics(blackboardRoot);
+      } catch {
+        // state.json недоступен — fallback на статический роутинг (не валить задачу).
+      }
+    }
     for (const spec of fanOuts) {
       const fo = await runFanOut(
         task.id, spec, allSteps, opts.prompt, projectPath,
         integrationWtPath, breaker,
         threshold, effectiveMaxParallel,
-        ctxCache, activeTask,
+        ctxCache, activeTask, opts.noCache, opts.cacheTtlSec, blackboardRoot, agentMetrics,
       );
       if (!fo.allApproved) overallSuccess = false;
     }
@@ -1005,7 +1191,7 @@ export async function runWorkflow(opts: RunOptions): Promise<RunResult> {
         const r = await runStep(
           task.id, step, allSteps.indexOf(step), opts.prompt,
           projectPath, integrationWtPath, breaker, allSteps,
-          1, undefined, ctxCache, activeTask,
+          1, undefined, ctxCache, activeTask, opts.noCache, opts.cacheTtlSec, blackboardRoot,
         );
         if (!r.result.success) {
           overallSuccess = false;
@@ -1048,7 +1234,7 @@ export async function runWorkflow(opts: RunOptions): Promise<RunResult> {
         const r = await runStep(
           task.id, step, allSteps.indexOf(step), opts.prompt,
           projectPath, integrationWtPath, breaker, allSteps,
-          iteration, contextOverride, ctxCache, activeTask,
+          iteration, contextOverride, ctxCache, activeTask, opts.noCache, opts.cacheTtlSec, blackboardRoot,
         );
         if (!r.result.success) {
           stepFailed = true;
@@ -1105,7 +1291,7 @@ export async function runWorkflow(opts: RunOptions): Promise<RunResult> {
         const r = await runStep(
           task.id, step, allSteps.indexOf(step), opts.prompt,
           projectPath, integrationWtPath, breaker, allSteps,
-          1, undefined, ctxCache, activeTask,
+          1, undefined, ctxCache, activeTask, opts.noCache, opts.cacheTtlSec, blackboardRoot,
         );
         if (!r.result.success) {
           overallSuccess = false;
@@ -1145,6 +1331,47 @@ export async function runWorkflow(opts: RunOptions): Promise<RunResult> {
     });
   }
 
+  // ─── T4: запись узлов памяти (Decision/Mistake/Pattern) ───
+  // Извлекаем из review/final шагов эвристиками, пишем в knowledge.db.
+  // Best-effort: ошибка логируется, но не валит задачу (как archiveTask/report).
+  try {
+    const memCount = await recordTaskMemory(task.id, projectPath, blackboardRoot);
+    if (memCount > 0) {
+      await logEvent({
+        task_id: task.id, step_id: null, level: "info",
+        kind: "memory_recorded", message: `recorded ${memCount} memory node(s)`,
+      });
+    }
+  } catch (e) {
+    await logEvent({
+      task_id: task.id, step_id: null, level: "warn",
+      kind: "memory_record_failed",
+      message: `recordTaskMemory failed: ${e instanceof Error ? e.message : String(e)}`,
+    });
+  }
+
+  // ─── T2: per-run отчёт (метрики + diff + вердикты + cache hits) ───
+  // Best-effort, как archiveTask: ошибка логируется, но не валит задачу.
+  try {
+    const report = await generateReport(task.id, blackboardRoot, {
+      changedFiles,
+      baseSha,
+      integrationBranch: integrationBranch(task.id),
+      gitRoot: projectPath, // review #10: integration-ветка в target project
+    });
+    const reportPath = await writeReport(report, blackboardRoot);
+    await logEvent({
+      task_id: task.id, step_id: null, level: "info",
+      kind: "report_written", message: reportPath,
+    });
+  } catch (e) {
+    await logEvent({
+      task_id: task.id, step_id: null, level: "warn",
+      kind: "report_failed",
+      message: `report generation failed: ${e instanceof Error ? e.message : String(e)}`,
+    });
+  }
+
   // При провале — cleanup integration worktree (ветку оставляем для разбора).
   // При успехе — worktree живёт до acceptTask (ветка нужна для merge в main).
   // point #9 (исключение): при ЧАСТИЧНОМ провале fan-out НЕ удаляем integration-worktree —
@@ -1169,6 +1396,15 @@ export async function runWorkflow(opts: RunOptions): Promise<RunResult> {
     if (integration) {
       await removeIntegrationWorktree(projectPath, integration.worktreePath).catch(() => {});
     }
+    // T2: отчёт и для failed-пути (без diff — baseSha мог быть не снят).
+    try {
+      const report = await generateReport(task.id, blackboardRoot, {
+        integrationBranch: integrationBranch(task.id),
+      });
+      await writeReport(report, blackboardRoot);
+    } catch {
+      // best-effort — падение генерации отчёта не усугубляет ошибку задачи
+    }
     // ^ integration.worktreePath безопасен здесь: внутри if (integration) — TS сужает.
     throw err; // пере-бросаем: CLI покажет ошибку пользователю.
   } finally {
@@ -1176,5 +1412,7 @@ export async function runWorkflow(opts: RunOptions): Promise<RunResult> {
     // на последующих задачах (если раннер переиспользуется в одном процессе).
     removeShutdownHandler();
     integrationRef.value = null;
+    // review #25: global run lock освобождается во внешнем try/finally
+    // runWorkflow (после возврата/исключения из runWorkflowBody).
   }
 }

@@ -24,17 +24,85 @@ export interface ArchitectResult {
 }
 
 /**
+ * Lenient-извлечение ключей из JSON, который не парсится строго (модели часто
+ * кладут markdown с ``` и неэкранированными " внутрь значений).
+ *
+ * Стратегия: для каждого ключа ищем `"key"\s*:\s*"` — начало значения. Конец
+ * значения = позиция перед следующим ключом из ARCHITECT_KEYS (или `}` перед
+ * концом строки). Затем unescape: `\n` → newline, `\"` → `"`, `\\` → `\`.
+ */
+function extractKeysLenient(jsonStr: string): Record<string, string> | null {
+  const result: Record<string, string> = {};
+  // Позиции начал всех ключей.
+  const positions: { key: string; start: number }[] = [];
+  for (const key of ARCHITECT_KEYS) {
+    const re = new RegExp(`"${key}"\\s*:\\s*"`, "g");
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(jsonStr)) !== null) {
+      positions.push({ key, start: m.index + m[0].length });
+    }
+  }
+  if (positions.length === 0) return null;
+  positions.sort((a, b) => a.start - b.start);
+
+  for (let i = 0; i < positions.length; i++) {
+    const { key, start } = positions[i]!;
+    // Конец значения: начало следующего ключа, или последний `}` в строке.
+    let end: number;
+    if (i + 1 < positions.length) {
+      end = positions[i + 1]!.start;
+      // Откатываемся до запятой/закрывающей кавычки перед следующим ключом.
+      // Ищем `",` или `"` перед end.
+      const beforeNext = jsonStr.slice(start, end);
+      const lastQuote = beforeNext.lastIndexOf('"');
+      if (lastQuote > 0) {
+        end = start + lastQuote;
+      }
+    } else {
+      // Последний ключ — берём до последней `}` в строке.
+      const lastBrace = jsonStr.lastIndexOf("}");
+      end = lastBrace > start ? lastBrace : jsonStr.length;
+      // Откатываемся до закрывающей кавычки перед `}`.
+      const beforeBrace = jsonStr.slice(start, end);
+      const lastQuote = beforeBrace.lastIndexOf('"');
+      if (lastQuote > 0) {
+        end = start + lastQuote;
+      }
+    }
+    let raw = jsonStr.slice(start, end);
+    // Убираем trailing запятую/пробелы если остались.
+    raw = raw.replace(/[,}\s]+$/, "");
+    // Unescape: \n → newline, \" → ", \\ → \, \t → tab.
+    const unescaped = raw
+      .replace(/\\n/g, "\n")
+      .replace(/\\t/g, "\t")
+      .replace(/\\"/g, '"')
+      .replace(/\\\\/g, "\\");
+    result[key] = unescaped;
+  }
+  return result;
+}
+
+/**
  * Распарсить вывод архитектора в структуру.
- * Переваривает: голый JSON, JSON в ```json fence, лишний текст вокруг.
- * Возвращает null если JSON невалиден или нет ни одного ожидаемого ключа.
+ * Переваривает: голый JSON, JSON в ```json fence, лишний текст вокруг,
+ * markdown с code-fences и неэкранированными кавычками внутри JSON-значений.
+ * Возвращает null если нет ни одного ожидаемого ключа.
  */
 export function parseArchitectJson(output: string): ArchitectResult | null {
-  // 1. Попытка вытащить JSON из fence ```json ... ```
+  // 1. Попытка вытащить JSON из fence ```json ... ```.
+  // ВАЖНО: используем greedy-поиск последнего ```, т.к. внутри JSON-значений
+  // могут быть markdown code-fences (```), и non-greedy обрежет JSON на первом
+  // внутреннем ```.
   let jsonStr: string | null = null;
-  const fenceMatch = output.match(/```(?:json)?\s*\n?([\s\S]*?)```/);
-  if (fenceMatch) {
-    jsonStr = fenceMatch[1]!.trim();
-  } else {
+  const fenceStart = output.match(/```(?:json)?\s*\n?/);
+  if (fenceStart) {
+    const lastFenceEnd = output.lastIndexOf("```");
+    if (lastFenceEnd > fenceStart.index! + fenceStart[0].length) {
+      jsonStr = output.slice(fenceStart.index! + fenceStart[0].length, lastFenceEnd).trim();
+    }
+  }
+  if (!jsonStr) {
     // 2. Попытка найти первый { и последний } (голый JSON, возможно с текстом вокруг)
     const firstBrace = output.indexOf("{");
     const lastBrace = output.lastIndexOf("}");
@@ -44,12 +112,19 @@ export function parseArchitectJson(output: string): ArchitectResult | null {
   }
   if (!jsonStr) return null;
 
-  let parsed: Record<string, unknown>;
+  // 3. Сначала пробуем строгий JSON.parse (работает для well-formed вывода).
+  let parsed: Record<string, unknown> | null = null;
   try {
     parsed = JSON.parse(jsonStr);
   } catch {
-    return null;
+    // 4. Fallback: модели часто кладут markdown с code-fences (```) и
+    // неэкранированными кавычками внутрь JSON-значений, ломая JSON.parse.
+    // Извлекаем каждый ключ отдельно: ищем "key": " и берём всё до
+    // следующего "key": или до закрывающей }.
+    parsed = extractKeysLenient(jsonStr);
   }
+
+  if (!parsed) return null;
 
   // Проверяем, что есть хотя бы один ожидаемый ключ.
   const result: Partial<ArchitectResult> = {};

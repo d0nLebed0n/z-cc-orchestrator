@@ -4,6 +4,7 @@ import {
   ConflictException,
   Get,
   HttpCode,
+  Inject,
   NotFoundException,
   Param,
   Post,
@@ -18,9 +19,10 @@ import { ProcessManager } from "./process-manager.service";
  */
 @Controller("tasks")
 export class TasksController {
+  // @Inject явно: tsx (esbuild) не эмитит decorator metadata.
   constructor(
-    private readonly reader: BlackboardReader,
-    private readonly manager: ProcessManager,
+    @Inject(BlackboardReader) private readonly reader: BlackboardReader,
+    @Inject(ProcessManager) private readonly manager: ProcessManager,
   ) {}
 
   @Get()
@@ -59,5 +61,44 @@ export class TasksController {
       throw new ConflictException(`accept failed: ${res.output.slice(-500)}`);
     }
     return { ok: true, message: `merged integration → main for ${id}` };
+  }
+
+  /**
+   * Перезапустить задачу: берёт prompt/workflow/project из исходной задачи
+   * и запускает новый subprocess через ProcessManager.start() (с SSE-стримом).
+   * Возвращает clientKey — как POST /processes, чтобы UI стримил логи.
+   *
+   * review #46 (review-2026-07-13): проверяем, что исходная задача в терминальном
+   * статусе (failed/done/escalated_hitl). Раньше контракт не гарантировал этого —
+   * прямой вызов API мог перезапустить ещё бегущую задачу (второй subprocess).
+   * done тоже допускаем (пользователь может перезапустить успешно завершённую).
+   */
+  @Post(":id/restart")
+  @HttpCode(200)
+  async restart(@Param("id") id: string) {
+    const task = await this.reader.getTask(id);
+    if (!task) throw new NotFoundException(`task ${id} not found`);
+    const TERMINAL = new Set(["failed", "done", "escalated_hitl"]);
+    if (!TERMINAL.has(task.status)) {
+      throw new ConflictException(
+        `task ${id} is not terminal (status=${task.status}). Only failed/done/escalated_hitl can be restarted.`,
+      );
+    }
+    const workflowName = task.workflow.split("/").pop()?.replace(/\.ya?ml$/, "") ?? "default";
+    const res = this.manager.start({
+      prompt: task.prompt,
+      workflow: workflowName,
+      project: task.project,
+    });
+    if (!res.ok) {
+      if (res.reason === "busy") {
+        throw new ConflictException({
+          message: "another task is already running",
+          activeTaskId: res.activeTaskId,
+        });
+      }
+      throw new ConflictException(res.message ?? "invalid project");
+    }
+    return { clientKey: res.clientKey, taskId: null };
   }
 }

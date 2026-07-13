@@ -3,7 +3,7 @@
 import { useState } from "react";
 import { api } from "@/shared/api";
 import type { ModelDto, ModelKind, Family } from "@/entities";
-import { KIND_LABELS, FAMILY_LABELS, ROLE_LABELS, type Role } from "@/entities";
+import { KIND_LABELS, FAMILY_LABELS } from "@/entities";
 
 interface Props {
   onClose: () => void;
@@ -47,7 +47,6 @@ export function AddModelModal({ onClose, onSaved, editing }: Props) {
   const [baseUrl, setBaseUrl] = useState(editing?.base_url ?? "");
   const [modelName, setModelName] = useState(editing?.model ?? "");
   const [apiKey, setApiKey] = useState("");
-  const [assignRole, setAssignRole] = useState<Role | "">("");
   const [detectResult, setDetectResult] = useState<{ found: boolean; path?: string; version?: string } | null>(null);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -70,22 +69,34 @@ export function AddModelModal({ onClose, onSaved, editing }: Props) {
     setError(null);
     setSaving(true);
     try {
-      const body = {
-        id: id || label.toLowerCase().replace(/\s+/g, "-"),
-        label,
-        kind,
-        family,
-        ...(isApi ? { provider, base_url: baseUrl, api_key: apiKey || undefined } : {}),
-        ...(isOllama ? { base_url: baseUrl, model: modelName } : {}),
-      };
+      // review #2 (review-2026-07-13): отдельный update-body без id/kind —
+      // backend modelUpdateSchema их не принимает (kind неизменяем, id запрещён
+      // менять #8). Раньше отправляли тот же body, что create → 400.
       if (editing) {
-        await api.updateModel(editing.id, body);
+        const updateBody: Record<string, string> = { label };
+        if (family) updateBody.family = family;
+        if (isApi) {
+          if (baseUrl) updateBody.base_url = baseUrl;
+          if (modelName) updateBody.model = modelName;
+          if (apiKey) updateBody.api_key = apiKey;
+        }
+        if (isOllama) {
+          if (baseUrl) updateBody.base_url = baseUrl;
+          if (modelName) updateBody.model = modelName;
+        }
+        await api.updateModel(editing.id, updateBody);
       } else {
-        await api.createModel(body);
-      }
-      if (assignRole) {
-        // Назначение роли — через SettingsRoles; здесь просто создаём модель.
-        // Пользователь назначит роль в секции ролей.
+        const createBody = {
+          id: id || label.toLowerCase().replace(/\s+/g, "-"),
+          label,
+          kind,
+          family,
+          // review #32: API-модель тоже передаёт model (раньше терялось в create;
+          // update уже отправлял). ollama передаёт model как и раньше.
+          ...(isApi ? { provider, base_url: baseUrl, model: modelName || undefined, api_key: apiKey || undefined } : {}),
+          ...(isOllama ? { base_url: baseUrl, model: modelName } : {}),
+        };
+        await api.createModel(createBody);
       }
       onSaved();
       onClose();
@@ -98,6 +109,9 @@ export function AddModelModal({ onClose, onSaved, editing }: Props) {
 
   return (
     <div
+      role="dialog"
+      aria-modal="true"
+      aria-label={editing ? "Редактировать модель" : "Добавить модель"}
       style={{
         position: "fixed",
         inset: 0,
@@ -130,13 +144,15 @@ export function AddModelModal({ onClose, onSaved, editing }: Props) {
             <label style={labelStyle}>Тип</label>
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 16 }}>
               {(Object.keys(KIND_LABELS) as ModelKind[]).map((k) => (
-                <div
+                <button
                   key={k}
-                  style={kind === k ? cardActiveStyle : cardStyle}
+                  type="button"
+                  aria-pressed={kind === k}
+                  style={{ ...kind === k ? cardActiveStyle : cardStyle, border: "1px solid transparent", cursor: "pointer" }}
                   onClick={() => { setKind(k); setDetectResult(null); }}
                 >
                   <div style={{ fontWeight: 600, fontSize: 14 }}>{KIND_LABELS[k]}</div>
-                </div>
+                </button>
               ))}
             </div>
           </>
@@ -192,6 +208,8 @@ export function AddModelModal({ onClose, onSaved, editing }: Props) {
             </select>
             <label style={labelStyle}>Base URL</label>
             <input style={{ ...inputStyle, marginBottom: 12 }} value={baseUrl} onChange={(e) => setBaseUrl(e.target.value)} placeholder="https://api.example.com" />
+            <label style={labelStyle}>Имя модели (optional для provider=openai)</label>
+            <input style={{ ...inputStyle, marginBottom: 12 }} value={modelName} onChange={(e) => setModelName(e.target.value)} placeholder="напр. gpt-4o (если эндпоинт требует явно)" />
             <label style={labelStyle}>API Key</label>
             <input type="password" style={{ ...inputStyle, marginBottom: 12 }} value={apiKey} onChange={(e) => setApiKey(e.target.value)} placeholder={editing ? "(оставить пустым = не менять)" : "sk-..."} />
           </>

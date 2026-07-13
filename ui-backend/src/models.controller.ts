@@ -7,16 +7,18 @@ import {
   Body,
   Param,
   Query,
+  Inject,
   BadRequestException,
   NotFoundException,
   InternalServerErrorException,
 } from "@nestjs/common";
 import { ModelsService } from "./models.service";
-import type { ModelInputDto, UpdateRolesDto } from "./models.dto";
+import { modelInputSchema, modelUpdateSchema, updateRolesSchema } from "./models.dto";
 
 @Controller("models")
 export class ModelsController {
-  constructor(private readonly models: ModelsService) {}
+  // @Inject явно: tsx (esbuild) не эмитит decorator metadata.
+  constructor(@Inject(ModelsService) private readonly models: ModelsService) {}
 
   @Get()
   async list() {
@@ -41,9 +43,16 @@ export class ModelsController {
   }
 
   @Post()
-  async create(@Body() body: ModelInputDto) {
+  async create(@Body() body: unknown) {
+    // Runtime-валидация (review #7): TS-интерфейсы исчезают в рантайме.
+    let input;
     try {
-      return await this.models.create(body);
+      input = modelInputSchema.parse(body);
+    } catch (e) {
+      throw new BadRequestException(formatZodError(e));
+    }
+    try {
+      return await this.models.create(input);
     } catch (e) {
       // Expected domain error: duplicate id → 400 with the message.
       const msg = (e as Error).message;
@@ -56,15 +65,35 @@ export class ModelsController {
   // Static path: MUST come before @Put(":id"), otherwise PUT /models/roles
   // would be captured by the :id route with id="roles".
   @Put("roles")
-  async updateRoles(@Body() body: UpdateRolesDto) {
-    await this.models.updateRoles(body);
+  async updateRoles(@Body() body: unknown) {
+    let dto;
+    try {
+      dto = updateRolesSchema.parse(body);
+    } catch (e) {
+      throw new BadRequestException(formatZodError(e));
+    }
+    try {
+      await this.models.updateRoles(dto);
+    } catch (e) {
+      const msg = (e as Error).message;
+      if (msg.includes("references unknown model")) {
+        throw new BadRequestException(msg);
+      }
+      throw new InternalServerErrorException("Failed to update roles");
+    }
     return { ok: true };
   }
 
   @Put(":id")
-  async update(@Param("id") id: string, @Body() body: Partial<ModelInputDto>) {
+  async update(@Param("id") id: string, @Body() body: unknown) {
+    let input;
     try {
-      return await this.models.update(id, body);
+      input = modelUpdateSchema.parse(body);
+    } catch (e) {
+      throw new BadRequestException(formatZodError(e));
+    }
+    try {
+      return await this.models.update(id, input);
     } catch (e) {
       const msg = (e as Error).message;
       // Expected domain error: missing model → 404 with the message.
@@ -85,4 +114,18 @@ export class ModelsController {
       throw new InternalServerErrorException("Failed to remove model");
     }
   }
+}
+
+/**
+ * Перевести ZodError в компактное человекочитаемое сообщение для 400-ответа.
+ * Не раскрывает внутренности сервера — только то, что не прошло валидацию.
+ */
+function formatZodError(e: unknown): string {
+  if (e && typeof e === "object" && "errors" in e && Array.isArray((e as { errors: unknown[] }).errors)) {
+    const errs = (e as { errors: { path: (string|number)[]; message: string }[] }).errors;
+    return errs
+      .map((er) => `${er.path.join(".") || "(root)"}: ${er.message}`)
+      .join("; ");
+  }
+  return "invalid request body";
 }

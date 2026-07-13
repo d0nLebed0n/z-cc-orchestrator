@@ -9,11 +9,12 @@
  *
  * Раннер — единственный писатель. Воркеры stateless.
  */
-import { mkdir, readFile, writeFile, readdir } from "node:fs/promises";
+import { mkdir, readFile, readdir } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { randomUUID } from "node:crypto";
 import { Mutex } from "async-mutex";
+import { atomicWrite } from "./lib/atomic-write.ts";
 
 export const BLACKBOARD_DIR = ".orchestrator";
 const RESULTS_DIR = join(BLACKBOARD_DIR, "results");
@@ -30,6 +31,13 @@ export type StepStatus =
 
 export type TaskStatus = "pending" | "running" | "done" | "failed" | "escalated_hitl";
 
+/**
+ * Откуда взялся результат шага: реальный вызов агента или cache hit (T1).
+ * review New#2 (T1-T5): metrics исключает cache-hit из reliability/latency,
+ * иначе cache-heavy агент выглядит быстрее/надёжнее, не запуская модель.
+ */
+export type StepSource = "worker" | "cache";
+
 export interface StepRecord {
   id: string;
   task_id: string;
@@ -43,6 +51,8 @@ export interface StepRecord {
   /** Путь к sidecar-файлу результата в results/. */
   result_path: string | null;
   error: string | null;
+  /** Источник результата. По умолчанию "worker" (для обратной совместимости со старым state.json). */
+  source?: StepSource;
 }
 
 export interface TaskRecord {
@@ -74,19 +84,37 @@ export async function initBlackboard(root = process.cwd()): Promise<void> {
     if (!existsSync(d)) await mkdir(d, { recursive: true });
   }
   if (!existsSync(join(root, STATE_FILE))) {
-    await writeFile(join(root, STATE_FILE), JSON.stringify({ tasks: [] }, null, 2));
+    await atomicWrite(join(root, STATE_FILE), JSON.stringify({ tasks: [] }, null, 2));
   }
 }
 
+/**
+ * Прочитать state.json. При повреждённом JSON НЕ молчим и не возвращаем пустой
+ * список (это затёрло бы существующие задачи при следующей записи — review #3).
+ * Сохраняем повреждённый файл как backup и кидаем явную ошибку.
+ */
 async function readState(root = process.cwd()): Promise<BlackboardState> {
   await initBlackboard(root);
   const raw = await readFile(join(root, STATE_FILE), "utf8");
-  return JSON.parse(raw) as BlackboardState;
+  try {
+    return JSON.parse(raw) as BlackboardState;
+  } catch (e) {
+    // Сохраним битый файл для разбора, чтобы не потерять данные молча.
+    const backup = join(root, STATE_FILE + `.corrupt-${Date.now()}`);
+    try {
+      await atomicWrite(backup, raw);
+    } catch {
+      // даже backup не удался — не усугубляем
+    }
+    throw new Error(
+      `state.json is corrupted (saved to ${backup}): ${e instanceof Error ? e.message : e}`,
+    );
+  }
 }
 
 async function writeState(state: BlackboardState, root = process.cwd()): Promise<void> {
   await initBlackboard(root);
-  await writeFile(join(root, STATE_FILE), JSON.stringify(state, null, 2));
+  await atomicWrite(join(root, STATE_FILE), JSON.stringify(state, null, 2));
 }
 
 /**
@@ -244,7 +272,7 @@ export async function writeResult(
   await initBlackboard(root);
   const path = join(root, RESULTS_DIR, `${taskId}-${stepId}.json`);
   await mkdir(dirname(path), { recursive: true });
-  await writeFile(path, JSON.stringify(payload, null, 2));
+  await atomicWrite(path, JSON.stringify(payload, null, 2));
   return path;
 }
 
@@ -262,7 +290,7 @@ export async function writeCheckpoint(
 ): Promise<string> {
   await initBlackboard(root);
   const path = join(root, CHECKPOINTS_DIR, `${taskId}-${n}.json`);
-  await writeFile(path, JSON.stringify({ task_id: taskId, n, ...digest, at: new Date().toISOString() }, null, 2));
+  await atomicWrite(path, JSON.stringify({ task_id: taskId, n, ...digest, at: new Date().toISOString() }, null, 2));
   return path;
 }
 
