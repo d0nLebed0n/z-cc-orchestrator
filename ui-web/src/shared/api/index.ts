@@ -1,5 +1,5 @@
 import { API_URL } from "../config";
-import type { ModelDto, TaskRecord, WorkflowDto, ProjectDto } from "@/entities";
+import type { ModelDto, TaskRecord, WorkflowDto, ProjectDto, StepResult } from "@/entities";
 
 async function json<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`${API_URL}${path}`, {
@@ -19,7 +19,7 @@ export const api = {
   listTasks: () => json<TaskRecord[]>("/tasks"),
   getTask: (id: string) => json<TaskRecord>(`/tasks/${id}`),
   getStepResult: (id: string, stepId: string) =>
-    json<unknown>(`/tasks/${id}/steps/${stepId}/result`),
+    json<StepResult>(`/tasks/${id}/steps/${stepId}/result`),
 
   /** Запустить задачу. Возвращает clientKey для подписки на SSE. */
   startTask: (body: { prompt: string; workflow: string; project?: string }) =>
@@ -60,9 +60,7 @@ export const api = {
 
   updateModel: (id: string, body: Partial<{
     label: string;
-    kind: ModelDto["kind"];
     family: ModelDto["family"];
-    provider: "anthropic" | "openai";
     base_url: string;
     model: string;
     api_key: string;

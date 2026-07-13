@@ -1,6 +1,7 @@
 import { Injectable, Logger } from "@nestjs/common";
 import { ChildProcess, spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
+import { StringDecoder } from "node:string_decoder";
 import { PATHS, ORCHESTRATOR_ROOT } from "./config";
 import { validateProjectPath, validationMessage } from "./path-utils";
 
@@ -22,6 +23,13 @@ export interface ProcessSession {
   exitCode: number | null;
   /** true если завершился успехом (код 0). */
   success: boolean;
+  /**
+   * Аккумуляторы небезопасной нарезки потока по строкам (review #11).
+   * StringDecoder склеивает многобайтовый символ, разрезанный границей chunk'а;
+   * lineTail хранит незавершённую строку до прихода следующего '\n'.
+   */
+  decoders: { stdout: StringDecoder; stderr: StringDecoder };
+  lineTail: { stdout: string; stderr: string };
 }
 
 export interface StartOptions {
@@ -119,12 +127,24 @@ export class ProcessManager extends EventEmitter {
       exited: false,
       exitCode: null,
       success: false,
+      decoders: { stdout: new StringDecoder("utf8"), stderr: new StringDecoder("utf8") },
+      lineTail: { stdout: "", stderr: "" },
     };
     this.sessions.set(clientKey, session);
 
     const handleData = (stream: "stdout" | "stderr") => (chunk: Buffer) => {
-      const text = chunk.toString("utf8");
-      for (const line of text.split("\n")) {
+      // StringDecoder склеивает многобайтовый символ, разрезанный границей chunk'а,
+      // и накапливает хвост — раньше каждый chunk нарезался по '\n' независимо,
+      // частичная строка становилась несколькими log entries (review #11).
+      const decoded = session.decoders[stream].write(chunk);
+      // Присоединяем хвост от предыдущего chunk'а.
+      const text = session.lineTail[stream] + decoded;
+      const lines = text.split("\n");
+      // Последний элемент — незавершённая строка (без завершающего '\n'); оставляем на след. chunk.
+      session.lineTail[stream] = lines.pop() ?? "";
+      for (const line of lines) {
+        // Пустые строки между '\n' пропускаем (как раньше), но реальная пустая строка
+        // вывода тоже даёт '' — пропускаем сознательно, log entries только непустые.
         if (line.length === 0) continue;
         const entry: LogLine = { stream, line, ts: new Date().toISOString() };
         session.buffer.push(entry);
@@ -149,6 +169,9 @@ export class ProcessManager extends EventEmitter {
       session.exited = true;
       session.exitCode = code;
       session.success = code === 0;
+      // Flush остатков StringDecoder + незавершённого хвоста строки (review #11).
+      this.flushTail(session, "stdout");
+      this.flushTail(session, "stderr");
       this.logger.log(`process ${clientKey} exited code=${code} signal=${signal}`);
       this.emit("exit", { clientKey, code, success: session.success });
       // Не удаляем сессию сразу — фронт может ещё дочитывать. Удаляем по таймауту.
@@ -201,7 +224,39 @@ export class ProcessManager extends EventEmitter {
     return { ok: true };
   }
 
-  /** Запустить разовую команду и дождаться её завершения. */
+  /**
+   * Flush остатков StringDecoder + незавершённого хвоста строки при завершении
+   * процесса. Эмитит финальную log-line, если что-то осталось (review #11).
+   */
+  private flushTail(session: ProcessSession, stream: "stdout" | "stderr"): void {
+    let rest = session.decoders[stream].end();
+    rest = session.lineTail[stream] + rest;
+    session.lineTail[stream] = "";
+    if (rest.length === 0) return;
+    // Возможен trailing '\n' — split даст ['...', ''] — emit только непустые.
+    for (const line of rest.split("\n")) {
+      if (line.length === 0) continue;
+      const entry: LogLine = { stream, line, ts: new Date().toISOString() };
+      session.buffer.push(entry);
+      if (session.buffer.length > MAX_BUFFER) session.buffer.shift();
+      if (!session.taskId) {
+        const m = line.match(TASK_ID_RE);
+        if (m) {
+          session.taskId = m[0];
+          this.emit("task-id", { clientKey: session.clientKey, taskId: session.taskId });
+        }
+      }
+      this.emit("log", { clientKey: session.clientKey, entry });
+    }
+  }
+
+  /**
+   * Запустить разовую команду и дождаться её завершения.
+   *
+   * review #22 (review-2026-07-13): ring buffer (2 MB) + StringDecoder для
+   * обоих потоков — раньше output копился без лимита и резался по границе
+   * UTF-8 chunk'а. Используется accept'ом и project init.
+   */
   async runOnce(args: string[]): Promise<{ ok: boolean; code: number | null; output: string }> {
     return new Promise((resolve) => {
       const child = spawn("npx", ["tsx", PATHS.cli, ...args], {
@@ -209,11 +264,26 @@ export class ProcessManager extends EventEmitter {
         stdio: ["ignore", "pipe", "pipe"],
         env: process.env,
       });
+      const MAX = 2 * 1024 * 1024;
+      const stdoutDec = new StringDecoder("utf8");
+      const stderrDec = new StringDecoder("utf8");
       let output = "";
-      child.stdout?.on("data", (c: Buffer) => (output += c.toString("utf8")));
-      child.stderr?.on("data", (c: Buffer) => (output += c.toString("utf8")));
-      child.on("exit", (code) => resolve({ ok: code === 0, code, output }));
-      child.on("error", () => resolve({ ok: false, code: null, output }));
+      const append = (text: string): void => {
+        output += text;
+        if (output.length > MAX) output = output.slice(-MAX);
+      };
+      child.stdout?.on("data", (c: Buffer) => append(stdoutDec.write(c)));
+      child.stderr?.on("data", (c: Buffer) => append(stderrDec.write(c)));
+      child.on("exit", (code) => {
+        append(stdoutDec.end());
+        append(stderrDec.end());
+        resolve({ ok: code === 0, code, output });
+      });
+      child.on("error", () => {
+        append(stdoutDec.end());
+        append(stderrDec.end());
+        resolve({ ok: false, code: null, output });
+      });
     });
   }
 }

@@ -2,9 +2,9 @@ name: project-init
 description: |
   Генерация контекста проекта (00-project/*.md) ролью architect.
   Запускается при открытии проекта через UI (кнопка «Открыть проект»).
+  Модель берётся из карты ролей Settings (role: architect → model), а не хардкожена.
 steps:
   - id: discover
-    agent: claude
     role: architect
     effort: high
     budget:

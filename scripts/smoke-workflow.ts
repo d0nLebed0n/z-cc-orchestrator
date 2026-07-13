@@ -1,5 +1,16 @@
 import { WorkflowSchema, buildLoadedWorkflow, pathsOverlap, routeSubtask } from "../src/workflow.ts";
 import type { Subtask } from "../src/plan.ts";
+import { loadModelsConfig } from "../src/model-registry.ts";
+import { BLACKBOARD_DIR } from "../src/blackboard.ts";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+// review #10: routeSubtask зовёт getAgentFamily → нужен инициализированный
+// model registry (DEFAULT_CONFIG сеется автоматически во временную директорию).
+const regRoot = mkdtempSync(join(tmpdir(), "orch-smoke-wf-"));
+loadModelsConfig(join(regRoot, BLACKBOARD_DIR));
+
 function assert(cond: boolean, msg: string): void {
   if (!cond) { console.error("✗ " + msg); process.exit(1); }
   console.log("✓ " + msg);
@@ -60,3 +71,4 @@ expectThrow("fan_out inside loop.steps", () => WorkflowSchema.parse({ name: "x",
 expectThrow("fan_out inside post_steps", () => WorkflowSchema.parse({ name: "x", loop: { steps: [{ id: "s", agent: "glm", role: "implement", budget: { wall_time_sec: 1, max_steps: 1 } }, { id: "r", agent: "codex", role: "review", budget: { wall_time_sec: 1, max_steps: 1 }, depends_on: ["s"] }], exit_on: "r", max_iterations: 1 }, post_steps: [{ id: "f", fan_out: true, from_plan: "s", agents: ["ollama"], role: "implement", budget: { wall_time_sec: 1, max_steps: 1 } }] }));
 
 console.log("\nAll workflow checks passed.");
+rmSync(regRoot, { recursive: true, force: true });

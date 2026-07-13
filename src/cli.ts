@@ -41,6 +41,9 @@ function usage(): string {
     "  --workflow <name>      workflow yaml in workflows/ (default: default)",
     "  --project <path>       target repo (default: cwd)",
     "  --max-parallel <n>     cap parallel workers (default: workflow max_parallel or 3)",
+    "  --no-cache             disable agent response cache (always call real agents)",
+    "  --cache-ttl <sec>      cache entry TTL in seconds (default: unlimited)",
+    "  --no-smart-routing     disable metrics-aware fan-out routing (static threshold only)",
     "  --init-project         initialize project knowledge directory (architect role)",
     "  --project-slug <slug>  explicit slug for the project (used with --init-project)",
     "",
@@ -66,7 +69,12 @@ async function listWorkflows(): Promise<void> {
     const wf = parseYaml(raw);
     const name = wf.name ?? f.replace(/\.ya?ml$/, "");
     const desc = wf.description ? String(wf.description).split("\n")[0] : "";
-    const steps = Array.isArray(wf.steps) ? wf.steps.map((s: { agent: string; role: string }) => `${s.agent}(${s.role})`).join(" → ") : "?";
+    // Отображение шагов: если agent не задан (role-driven), показываем роль.
+    const stepsRaw = Array.isArray(wf.steps) ? wf.steps
+      : Array.isArray(wf.loop?.steps) ? wf.loop.steps
+      : Array.isArray(wf.post_steps) ? wf.post_steps
+      : [];
+    const steps = stepsRaw.map((s: { agent?: string; role: string }) => s.agent ? `${s.agent}(${s.role})` : s.role).join(" → ");
     console.log(`${name.padEnd(12)} ${steps.padEnd(50)} ${desc}`);
   }
 }
@@ -88,12 +96,26 @@ async function showStatus(): Promise<void> {
   }
 }
 
+/** Разобрать --cache-ttl <sec>: undefined если флаг не задан, число > 0 иначе. */
+function parseCacheTtl(raw: unknown): number | undefined {
+  if (typeof raw !== "string") return undefined;
+  const n = Number.parseInt(raw, 10);
+  if (!Number.isFinite(n) || n <= 0) {
+    console.error(`Invalid --cache-ttl value: '${raw}' (must be a positive integer)`);
+    process.exit(1);
+  }
+  return n;
+}
+
 async function main(): Promise<void> {
   const { values, positionals } = parseArgs({
     options: {
       workflow: { type: "string", short: "w" },
       project: { type: "string", short: "p" },
       "max-parallel": { type: "string" },
+      "no-cache": { type: "boolean", default: false },
+      "cache-ttl": { type: "string" },
+      "no-smart-routing": { type: "boolean", default: false },
       list: { type: "boolean", default: false },
       status: { type: "boolean", default: false },
       health: { type: "boolean", default: false },
@@ -122,10 +144,12 @@ async function main(): Promise<void> {
   // Проект: дефолт = cwd. Разрешаем рано — он нужен для загрузки реестра моделей
   // (<project>/.orchestrator/models.yaml) и для всех путей ниже.
   const project = typeof values.project === "string" ? resolve(values.project) : process.cwd();
-  // Загрузить реестр моделей из проекта. loadModelsConfig сеет дефолтный models.yaml
-  // при отсутствии и читает .secrets. Без этого getModel/getSecret/dispatchWorker/checkHealth
-  // падают с "loadModelsConfig() not called yet".
-  loadModelsConfig(join(project, BLACKBOARD_DIR));
+  // review #1 (review-2026-07-13): реестр моделей и секреты — ГЛОБАЛЬНО в
+  // ORCHESTRATOR_ROOT (там же, где backend/MCP их читают и пишут). Раньше
+  // грузили из <project>/.orchestrator — для внешнего --project это пустой
+  // дефолт, и ключи из UI не применялись. Теперь единый источник истины.
+  const orchestratorRoot = process.cwd();
+  loadModelsConfig(join(orchestratorRoot, BLACKBOARD_DIR));
 
   if (values.health) {
     // Проверяем все модели из реестра. checkHealth читает env (base_url/api_key)
@@ -239,6 +263,11 @@ async function main(): Promise<void> {
   }
 
   const workflowName = typeof values.workflow === "string" ? values.workflow : "default";
+  // review New#4 (T1-T5): только basename — запрет path traversal через ../.
+  if (!/^[a-zA-Z0-9_-]+$/.test(workflowName)) {
+    console.error(`Invalid workflow name: '${workflowName}' (must be basename: letters, digits, _, -)`);
+    process.exit(1);
+  }
   const workflowPath = join(WORKFLOWS_DIR, `${workflowName}.yaml`);
   if (!existsSync(workflowPath)) {
     console.error(`Workflow not found: ${workflowPath}`);
@@ -268,6 +297,9 @@ async function main(): Promise<void> {
     prompt,
     project,
     maxParallel,
+    noCache: values["no-cache"] === true,
+    cacheTtlSec: parseCacheTtl(values["cache-ttl"]),
+    noSmartRouting: values["no-smart-routing"] === true,
   });
 
   if (result.success) {

@@ -67,12 +67,23 @@ export class TasksController {
    * Перезапустить задачу: берёт prompt/workflow/project из исходной задачи
    * и запускает новый subprocess через ProcessManager.start() (с SSE-стримом).
    * Возвращает clientKey — как POST /processes, чтобы UI стримил логи.
+   *
+   * review #46 (review-2026-07-13): проверяем, что исходная задача в терминальном
+   * статусе (failed/done/escalated_hitl). Раньше контракт не гарантировал этого —
+   * прямой вызов API мог перезапустить ещё бегущую задачу (второй subprocess).
+   * done тоже допускаем (пользователь может перезапустить успешно завершённую).
    */
   @Post(":id/restart")
   @HttpCode(200)
   async restart(@Param("id") id: string) {
     const task = await this.reader.getTask(id);
     if (!task) throw new NotFoundException(`task ${id} not found`);
+    const TERMINAL = new Set(["failed", "done", "escalated_hitl"]);
+    if (!TERMINAL.has(task.status)) {
+      throw new ConflictException(
+        `task ${id} is not terminal (status=${task.status}). Only failed/done/escalated_hitl can be restarted.`,
+      );
+    }
     const workflowName = task.workflow.split("/").pop()?.replace(/\.ya?ml$/, "") ?? "default";
     const res = this.manager.start({
       prompt: task.prompt,

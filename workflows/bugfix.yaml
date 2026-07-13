@@ -1,0 +1,39 @@
+name: bugfix
+description: |
+  Bugfix-цикл: plan → fix → review (повторяет пока review не одобрит).
+  отличается от agentic ролями: implement → fix (semantic — чинит, не создаёт).
+  Модели берутся из карты ролей Settings (role → model), а не хардкожены.
+  Кросс-семейность enforced: fix ≠ review по family.
+steps: []
+loop:
+  steps:
+    - id: plan
+      role: plan
+      effort: high
+      budget:
+        wall_time_sec: 900
+        max_steps: 2
+      depends_on: []
+      target_paths: []
+
+    - id: fix
+      role: fix
+      effort: medium
+      budget:
+        wall_time_sec: 1200
+        max_steps: 2
+      depends_on: [plan]
+      target_paths: []
+
+    - id: review
+      role: review
+      effort: medium
+      budget:
+        wall_time_sec: 900
+        max_steps: 2
+        max_session_min: 25
+      depends_on: [fix]
+      target_paths: []
+  exit_on: review
+  max_iterations: 3
+  on_exhausted: hitl

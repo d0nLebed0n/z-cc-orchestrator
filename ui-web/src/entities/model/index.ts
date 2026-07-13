@@ -11,7 +11,9 @@ export interface ModelDto {
   provider?: "anthropic" | "openai";
   base_url?: string;
   model?: string;
-  status: "ready" | "not_found" | "unknown";
+  // review #33 (review-2026-07-13): согласовано с backend statusOf —
+  // missing_credentials (нет api_key) / invalid_config (нет base_url/model).
+  status: "ready" | "not_found" | "unknown" | "missing_credentials" | "invalid_config";
 }
 
 export const ROLE_LABELS: Record<Role, string> = {

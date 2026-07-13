@@ -59,6 +59,7 @@ const ROLE_SECTIONS: Record<Role, string[]> = {
     "00-project/code-map.md",
     "00-project/glossary.md",
     "$ACTIVE_TASK",
+    "$PAST_FACTS",
   ],
   implement: [
     "00-project/code-map.md",
@@ -111,14 +112,18 @@ function truncateAt(text: string, maxLen: number): string {
 }
 
 /**
- * Собрать контекст проекта для роли из кэша + activeTask.
+ * Собрать контекст проекта для роли из кэша + activeTask + pastFacts.
  * Чистая функция над данными в памяти (не читает диск).
  * Возвращает null если контекста нет (деградация).
+ *
+ * @param pastFacts top-N релевантных фактов из памяти проекта (T4) для plan-шага.
+ *                  null/undefined — секция пропускается (нет памяти или не plan).
  */
 export function buildProjectContext(
   role: Role,
   cache: ContextCache,
   activeTask: string | null,
+  pastFacts?: string | null,
 ): string | null {
   const sections = ROLE_SECTIONS[role];
   if (sections.length === 0) return null; // architect — не инъектируется
@@ -132,6 +137,11 @@ export function buildProjectContext(
       if (!activeTask) continue;
       content = activeTask;
       label = "active-task";
+    } else if (rel === "$PAST_FACTS") {
+      // T4: top-N релевантных Decisions/Mistakes/Patterns из knowledge.db.
+      if (!pastFacts) continue;
+      content = pastFacts;
+      label = "past-decisions-mistakes";
     } else {
       content = cache.get(rel) ?? null;
       if (!content) continue;

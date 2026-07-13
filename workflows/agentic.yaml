@@ -1,13 +1,12 @@
 name: agentic
 description: |
-  Агентский цикл: claude планирует → glm имплементит → codex ревьюит.
-  Повторяет пока codex не даст APPROVE (лимит 3 итерации, потом HITL).
-  Кросс-семейность: Anthropic(plan) → Z.ai(implement) → OpenAI(review).
+  Агентский цикл: plan → implement → review.
+  Повторяет пока review не даст APPROVE (лимит 3 итерации, потом HITL).
+  Модели берутся из карты ролей Settings (role → model), а не хардкожены.
 steps: []  # только цикл, без pre-loop шагов
 loop:
   steps:
     - id: plan
-      agent: claude
       role: plan
       effort: high
       budget:
@@ -17,7 +16,6 @@ loop:
       target_paths: []
 
     - id: implement
-      agent: glm
       role: implement
       effort: medium
       budget:
@@ -27,7 +25,6 @@ loop:
       target_paths: []
 
     - id: review
-      agent: codex
       role: review
       effort: medium
       budget:

@@ -1,0 +1,14 @@
+name: plan-only
+description: |
+  Только планирование — без исполнения. Для оценки подхода перед реальной
+  реализацией, или когда нужен декомпозиционный план для ручной работы.
+  Модель берётся из карты ролей Settings (role: plan → model).
+steps:
+  - id: plan
+    role: plan
+    effort: high
+    budget:
+      wall_time_sec: 900
+      max_steps: 2
+    depends_on: []
+    target_paths: []

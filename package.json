@@ -5,14 +5,18 @@
   "type": "module",
   "description": "Оркестрация трёх AI-CLI (Claude, Codex, GLM) единым Node/TS-раннером.",
   "bin": {
-    "ai-task": "bin/ai-task"
+    "ai-task": "bin/ai-task",
+    "ai-task-mcp": "bin/ai-task-mcp"
   },
   "scripts": {
     "dev": "tsx src/cli.ts",
     "ai-task": "tsx src/cli.ts",
+    "mcp": "tsx src/mcp/server.ts",
     "typecheck": "tsc --noEmit",
     "test": "vitest",
     "test:run": "vitest run",
+    "test:smoke": "tsx scripts/smoke-units.ts && tsx scripts/smoke-workflow.ts && tsx scripts/smoke-fanout-mock.ts && tsx scripts/smoke-plan.ts && tsx scripts/smoke-loop.ts && tsx scripts/smoke-bounded.ts && tsx scripts/smoke-stepid.ts && tsx scripts/smoke-ollama-tools.ts",
+    "test:ci": "npm run typecheck && npm run test:run && npm run test:smoke",
     "ui:backend": "tsx scripts/run-ui-backend.ts",
     "ui:web": "tsx scripts/run-ui-web.ts",
     "ui:health": "tsx scripts/ui-health.ts",
@@ -21,12 +25,15 @@
     "ui:full": "concurrently -n backend,web,open -c blue,green,yellow \"npm:ui:backend\" \"npm:ui:web\" \"npm:ui:open\""
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "async-mutex": "^0.5.0",
+    "better-sqlite3": "^12.11.1",
     "dotenv": "^16.4.5",
     "yaml": "^2.5.0",
     "zod": "^3.23.8"
   },
   "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^22.5.0",
     "concurrently": "^8.2.2",
     "tsx": "^4.23.0",

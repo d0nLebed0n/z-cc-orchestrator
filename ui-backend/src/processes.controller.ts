@@ -76,13 +76,18 @@ export class ProcessesController {
 
   /**
    * SSE-стрим. Шлёт:
-   *  - backlog (буфер过去的 строк) сразу при подключении
+   *  - session (clientKey + taskId, если уже известен) сразу при подключении
+   *  - backlog (буфер прошлых строк)
    *  - log-события по мере прихода
    *  - state-события (снимок задачи) раз в 1.5с
    *  - exit при завершении
+   *
+   * Важно: обработчики подписываются ДО отправки snapshot и сразу после этого
+   * проверяется session.exited — иначе процесс, завершившийся до SSE-connect,
+   * оставит EventSource открытым навсегда (review #4).
    */
   @Get(":key/stream")
-  stream(@Param("key") key: string, @Res() res: Response): void {
+  async stream(@Param("key") key: string, @Res() res: Response): Promise<void> {
     const session = this.manager.get(key);
     if (!session) {
       res.status(404).json({ message: `session ${key} not found` });
@@ -99,31 +104,37 @@ export class ProcessesController {
       res.write(`event: ${event}\n`);
       res.write(`data: ${JSON.stringify(data)}\n\n`);
     };
+    let closed = false;
+    const safeSend = (event: string, data: unknown) => {
+      if (!closed) send(event, data);
+    };
 
-    // 1. Идентификатор сессии (настоящий taskId если уже известен).
-    send("session", { clientKey: session.clientKey, taskId: session.taskId });
-
-    // 2. Backlog буфера.
-    for (const line of session.buffer) send("log", line);
-
-    // 3. Подписка на новые события процесса.
+    // Обработчики. Подписываем ИХ до snapshot, чтобы не пропустить событие,
+    // пришедшее между snapshot и подпиской (гонка).
     const onLog = (payload: { clientKey: string; entry: LogLine }) => {
-      if (payload.clientKey === session.clientKey) send("log", payload.entry);
+      if (payload.clientKey === session.clientKey) safeSend("log", payload.entry);
     };
     const onTaskId = (payload: { clientKey: string; taskId: string }) => {
-      if (payload.clientKey === session.clientKey) send("task-id", { taskId: payload.taskId });
+      if (payload.clientKey === session.clientKey) safeSend("task-id", { taskId: payload.taskId });
     };
-    const onExit = (payload: { clientKey: string; code: number | null; success: boolean }) => {
+    const onExit = async (payload: { clientKey: string; code: number | null; success: boolean }) => {
       if (payload.clientKey !== session.clientKey) return;
-      send("exit", { code: payload.code, success: payload.success });
-      cleanup();
-      res.end();
+      // review #5 (T1-T5): перед exit — финальный state, чтобы frontend увидел
+      // терминальный статус задачи (done/failed/escalated). Иначе при уходе
+      // процесса между ticks UI остаётся со статусом running.
+      if (session.taskId) {
+        this.reader.invalidate();
+        const finalTask = await this.reader.getTask(session.taskId).catch(() => null);
+        if (finalTask) safeSend("state", finalTask);
+      }
+      safeSend("exit", { code: payload.code, success: payload.success });
+      finish();
     };
     this.manager.on("log", onLog);
     this.manager.on("task-id", onTaskId);
     this.manager.on("exit", onExit);
 
-    // 4. Периодический снимок состояния задачи для прогресса шагов.
+    // Периодический снимок состояния задачи для прогресса шагов.
     let lastTaskJson = "";
     const stateTimer = setInterval(async () => {
       const id = session.taskId;
@@ -133,7 +144,7 @@ export class ProcessesController {
       const json = JSON.stringify(task);
       if (json !== lastTaskJson) {
         lastTaskJson = json;
-        send("state", task);
+        safeSend("state", task);
       }
       this.reader.invalidate();
     }, 1500);
@@ -144,6 +155,33 @@ export class ProcessesController {
       this.manager.off("task-id", onTaskId);
       this.manager.off("exit", onExit);
     };
+    const finish = () => {
+      if (closed) return;
+      closed = true;
+      cleanup();
+      res.end();
+    };
+
+    // ── Snapshot (ПОСЛЕ подписки на события) ──────────────────────────────
+    // 1. Идентификатор сессии (настоящий taskId если уже известен).
+    safeSend("session", { clientKey: session.clientKey, taskId: session.taskId });
+    // 2. Backlog буфера.
+    for (const line of session.buffer) safeSend("log", line);
+
+    // 3. Если процесс уже завершился ДО подключения — воспроизводим финальный
+    //    state + exit и закрываем response. review #9 (review-2026-07-13):
+    //    без финального state UI может остаться без terminal task status
+    //    (accept/notification зависят от state).
+    if (session.exited) {
+      if (session.taskId) {
+        this.reader.invalidate();
+        const finalTask = await this.reader.getTask(session.taskId).catch(() => null);
+        if (finalTask) safeSend("state", finalTask);
+      }
+      safeSend("exit", { code: session.exitCode, success: session.success });
+      finish();
+      return;
+    }
 
     res.on("close", cleanup);
   }

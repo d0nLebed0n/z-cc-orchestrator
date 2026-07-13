@@ -6,6 +6,18 @@ import { PATHS } from "./config";
 import type { BlackboardState, TaskRecord } from "./types";
 
 /**
+ * Сигнальная ошибка: state.json не распарсился (рваное чтение при
+ * кросс-процессной гонке или реальная порча). readState перехватывает её и
+ * отдаёт предыдущий валидный кеш вместо пустого списка (review #43).
+ */
+class StateParseError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "StateParseError";
+  }
+}
+
+/**
  * Чтение .orchestrator/state.json как внешнего файла.
  * Не зависит от кода раннера. Кеш на 1 c — state.json переписывается
  * целиком на каждом шаге, частые перечитывания избыточны.
@@ -21,9 +33,22 @@ export class BlackboardReader {
     if (this.cache && now - this.cache.at < this.ttlMs) {
       return this.cache.state;
     }
-    const state = await this.readStateFromDisk();
-    this.cache = { at: now, state };
-    return state;
+    try {
+      const state = await this.readStateFromDisk();
+      // review #43: кешируем только валидное состояние с диска.
+      this.cache = { at: now, state };
+      return state;
+    } catch (e) {
+      if (e instanceof StateParseError) {
+        // Повреждённый/рваный state — отдаём предыдущий валидный кеш, не
+        // подменяя пустым списком и не обновляя кеш. Лог уже записан в readStateFromDisk.
+        if (this.cache) return this.cache.state;
+        // Кеша ещё нет (первое чтение оказалось рваным) — честно пусто,
+        // но НЕ кешируем пустышку, чтобы следующий запрос перечитал диск.
+        return { tasks: [] };
+      }
+      throw e;
+    }
   }
 
   /** Принудительно сбросить кеш (после запуска/остановки задачи). */
@@ -31,21 +56,40 @@ export class BlackboardReader {
     this.cache = null;
   }
 
+  /**
+   * Прочитать state с диска.
+   *
+   * review #43 (review-2026-07-13): при ошибке парсинга НЕ подменяем пустым
+   * списком (это переоткрывает класс бага, закрытый на write-side #3 —
+   * потеря активного стрима/accept при рваном чтении). Бросаем StateParseError;
+   * readState перехватывает и отдаёт предыдущий валидный кеш.
+   * Корректный пустой случай (файла нет / tasks не массив) возвращает {tasks:[]}.
+   */
   private async readStateFromDisk(): Promise<BlackboardState> {
     if (!existsSync(PATHS.stateFile)) {
       return { tasks: [] };
     }
+    let raw: string;
     try {
-      const raw = await readFile(PATHS.stateFile, "utf8");
-      const parsed = JSON.parse(raw) as BlackboardState;
-      if (!parsed || !Array.isArray(parsed.tasks)) {
-        return { tasks: [] };
-      }
-      return parsed;
+      raw = await readFile(PATHS.stateFile, "utf8");
     } catch (e) {
-      this.logger.error(`Failed to read state.json: ${(e as Error).message}`);
+      // Ошибка чтения файла (отличная от ENOENT — он обработан выше) — не
+      // подменяем пустым. Бросаем, readState отдаст кеш.
+      throw new StateParseError(`Failed to read state.json: ${(e as Error).message}`);
+    }
+    let parsed: BlackboardState;
+    try {
+      parsed = JSON.parse(raw) as BlackboardState;
+    } catch (e) {
+      this.logger.error(`Corrupt state.json (unparseable): ${(e as Error).message}`);
+      throw new StateParseError(`Corrupt state.json: ${(e as Error).message}`);
+    }
+    if (!parsed || !Array.isArray(parsed.tasks)) {
+      // Структурно невалидный — считаем пустым (не кидаем: это не рваное чтение,
+      // а легальная деградация старого/битого формата).
       return { tasks: [] };
     }
+    return parsed;
   }
 
   async getTask(id: string): Promise<TaskRecord | null> {

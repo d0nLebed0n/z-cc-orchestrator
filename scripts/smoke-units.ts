@@ -1,11 +1,17 @@
 /**
  * Unit-smoke: семьи, envelope, выбор ревьюера, budget.
  * Запуск: npx tsx scripts/smoke-units.ts
+ *
+ * review #10: ранее падал на удалённом export `AGENTS` и на неинициализированном
+ * model registry. Теперь семьи берутся из registry (getAgentFamily), а реестр
+ * инициализируется во временную директорию (DEFAULT_CONFIG сеется автоматически).
  */
-import { AGENTS, pickReviewer, validReviewerFamilies } from "../src/families.ts";
+import { pickReviewer, validReviewerFamilies, getAgentFamily } from "../src/families.ts";
 import { makeEnvelope, validateEnvelope } from "../src/envelope.ts";
 import { consumeBudget, newBudgetState, CircuitBreaker } from "../src/resilience.ts";
 import { createTask, upsertStep, getTask, initBlackboard } from "../src/blackboard.ts";
+import { loadModelsConfig } from "../src/model-registry.ts";
+import { BLACKBOARD_DIR } from "../src/blackboard.ts";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -19,10 +25,16 @@ function assert(cond: boolean, msg: string): void {
 }
 
 async function main(): Promise<void> {
-  // Семьи
-  assert(AGENTS.claude.family === "anthropic", "claude → anthropic");
-  assert(AGENTS.codex.family === "openai", "codex → openai");
-  assert(AGENTS.glm.family === "zai", "glm → zai (not anthropic despite claude binary)");
+  // Инициализировать model registry во временную директорию (review #10):
+  // DEFAULT_CONFIG сеется автоматически при отсутствии models.yaml, после чего
+  // getAgentFamily/pickReviewer видят claude/codex/glm/ollama.
+  const regRoot = mkdtempSync(join(tmpdir(), "orch-smoke-reg-"));
+  loadModelsConfig(join(regRoot, BLACKBOARD_DIR));
+
+  // Семьи — из registry (AGENTS удалён, теперь families.ts делегирует реестру).
+  assert(getAgentFamily("claude") === "anthropic", "claude → anthropic");
+  assert(getAgentFamily("codex") === "openai", "codex → openai");
+  assert(getAgentFamily("glm") === "zai", "glm → zai (not anthropic despite claude binary)");
 
   // Valid reviewer families
   const revForOpenAI = validReviewerFamilies("openai");
@@ -58,7 +70,7 @@ async function main(): Promise<void> {
   console.log("✓ validateEnvelope(glm) ok");
 
   // local / ollama
-  assert(AGENTS.ollama.family === "local", "ollama → local");
+  assert(getAgentFamily("ollama") === "local", "ollama → local");
   assert(!validReviewerFamilies("anthropic").includes("local"), "local is NOT a reviewer for anthropic");
   assert(!validReviewerFamilies("openai").includes("local"), "local is NOT a reviewer for openai");
   assert(validReviewerFamilies("local").includes("anthropic"), "local code → anthropic can review");
@@ -131,6 +143,7 @@ async function main(): Promise<void> {
   const ids = new Set(after!.steps.map((s) => s.id));
   assert(steps.every((s) => ids.has(s.id)), "race: no step lost (all ids present)");
   rmSync(raceRoot, { recursive: true, force: true });
+  rmSync(regRoot, { recursive: true, force: true });
 
   console.log("\nAll unit checks passed.");
 }

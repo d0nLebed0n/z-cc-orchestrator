@@ -1,0 +1,24 @@
+name: review-only
+description: |
+  Только ревью существующего кода (без implement). Для аудита/проверки
+  уже написанного (внешнего) кода или вручную созданной ветки.
+  Модель берётся из карты ролей Settings (role: review → model).
+steps:
+  - id: review
+    role: review
+    effort: high
+    budget:
+      wall_time_sec: 1200
+      max_steps: 2
+      max_session_min: 30
+    depends_on: []
+    target_paths: []
+
+  - id: final
+    role: final
+    effort: medium
+    budget:
+      wall_time_sec: 600
+      max_steps: 1
+    depends_on: [review]
+    target_paths: []

@@ -1,9 +1,10 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { Mutex } from "async-mutex";
 import { slugFromPath } from "./slug.ts";
+import { atomicWrite } from "../lib/atomic-write.ts";
 
 /** Корень централизованного хранилища знаний проектов. */
 export const PROJECTS_ROOT = join(homedir(), ".orchestrator", "projects");
@@ -33,19 +34,32 @@ export function knowledgeDirFor(slug: string): string {
   return join(PROJECTS_ROOT, slug);
 }
 
+/**
+ * Прочитать registry. При повреждённом JSON НЕ молчим и не возвращаем пустой
+ * список — следующая запись затёрла бы существующие проекты (review #3).
+ * Сохраняем повреждённый файл как backup и кидаем явную ошибку.
+ */
 async function readRegistry(): Promise<ProjectRegistry> {
   if (!existsSync(REGISTRY_FILE)) return { projects: [] };
   const raw = await readFile(REGISTRY_FILE, "utf8");
   try {
     return JSON.parse(raw) as ProjectRegistry;
-  } catch {
-    return { projects: [] };
+  } catch (e) {
+    const backup = `${REGISTRY_FILE}.corrupt-${Date.now()}`;
+    try {
+      await atomicWrite(backup, raw);
+    } catch {
+      // даже backup не удался — не усугубляем
+    }
+    throw new Error(
+      `projects.json is corrupted (saved to ${backup}): ${e instanceof Error ? e.message : e}`,
+    );
   }
 }
 
 async function writeRegistry(reg: ProjectRegistry): Promise<void> {
   await mkdir(join(homedir(), ".orchestrator"), { recursive: true });
-  await writeFile(REGISTRY_FILE, JSON.stringify(reg, null, 2), "utf8");
+  await atomicWrite(REGISTRY_FILE, JSON.stringify(reg, null, 2));
 }
 
 /**

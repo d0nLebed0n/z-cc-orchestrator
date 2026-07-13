@@ -59,8 +59,18 @@ export class ProjectsService {
     }
     const absPath = v.path;
 
+    // review #12 (review-2026-07-13): запретить параллельный init, пока активна
+    // другая задача — иначе два CLI-процесса гоняют один state.json (review #7).
+    // Backend/MCP/runOnce теперь все уважают global run lock, но hasAlive —
+    // быстрая frontend-facing проверка, чтобы дать понятную ошибку в UI.
+    if (this.processManager.hasAlive()) {
+      throw new Error("another task is already running. Wait for it before initializing a project.");
+    }
+
     // runOnce: запускает CLI и ждёт завершения (без SSE-стрима).
     // UI показывает "generating..." и опрашивает GET /projects/:slug для статуса.
+    // TODO(#12): превратить в tracked session (clientKey + SSE), чтобы UI видел
+    // прогресс и мог остановить. Сейчас — blocking, как accept.
     const result = await this.processManager.runOnce([
       "--project", absPath,
       "--init-project",
@@ -114,6 +124,12 @@ export class ProjectsService {
 
   async regenerate(slug: string): Promise<{ project: ProjectDto }> {
     const entry = await this.getBySlug(slug);
+    // review #34 (review-2026-07-13): hasAlive-проверка против гонки blackboard,
+    // как в open(). Раньше regenerate её не имел — можно было запустить
+    // параллельный init поверх активной задачи (рваная запись state.json).
+    if (this.processManager.hasAlive()) {
+      throw new Error("another task is already running. Wait for it before regenerating project context.");
+    }
     const result = await this.processManager.runOnce([
       "--project", entry.projectPath,
       "--init-project",
