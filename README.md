@@ -51,7 +51,7 @@ npm run ui:full
 
 **Независимый запуск частей** (для отладки):
 ```bash
-npm run ui:backend   # только NestJS на :3001
+npm run ui:backend   # только NestJS на :8080
 npm run ui:web       # только Next.js на :3000
 npm run ui           # оба без авто-открытия браузера
 ```

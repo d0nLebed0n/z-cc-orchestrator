@@ -11,7 +11,7 @@ export const ORCHESTRATOR_ROOT = resolve(
   process.env.ORCHESTRATOR_ROOT ?? join(__dirname, "..", ".."),
 );
 
-export const PORT = Number(process.env.PORT ?? 3001);
+export const PORT = Number(process.env.PORT ?? 8080);
 
 export const WEB_ORIGIN = process.env.WEB_ORIGIN ?? "http://localhost:3000";
 
