@@ -14,10 +14,12 @@
  *   --json                       — стримить события в JSONL (сигнал #2)
  *   -o/--output-last-message F   — sidecar-файл (сигнал #3)
  *
- * Бинарник codex: на macOS-приложении путь /Applications/Codex.app/.../codex
- * (см. docs/decisions.md). Переопределяется env CODEX_BIN.
+ * review #65 (review-2026-07-13): бинарник codex по умолчанию живёт в
+ * /Applications/ChatGPT.app/Contents/Resources/codex (OpenAI влил standalone
+ * Codex.app в ChatGPT.app с версии 0.144.0+). Переопределяется env CODEX_BIN.
  */
 import { execFile } from "node:child_process";
+import { join } from "node:path";
 import { promisify } from "node:util";
 import type { TaskEnvelope } from "../envelope.ts";
 import type { WorkerFn, WorkerResult } from "./types.ts";
@@ -54,81 +56,89 @@ export const runCodex: WorkerFn = async (envelope, opts) => {
   // может быть вне основного репо). network_access для npm install задаётся
   // через -c sandbox_permissions (см. docs/versions.md).
   // sidecar-файл (сигнал #3): --output-last-message пишет last-message на диск.
-  const lastMsgFile = await (async () => {
-    const { mkdtemp } = await import("node:fs/promises");
-    const { tmpdir } = await import("node:os");
-    const { join } = await import("node:path");
-    const d = await mkdtemp(join(tmpdir(), "codex-lastmsg-"));
-    return join(d, "last-message.txt");
-  })();
+  // review #59 (review-2026-07-13): каталог сохраняется для очистки в finally —
+  // раньше каждый запуск оставлял /tmp/codex-lastmsg-* на диске.
+  const { mkdtemp, readFile, rm } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const tmpDir = await mkdtemp(join(tmpdir(), "codex-lastmsg-"));
+  const lastMsgFile = join(tmpDir, "last-message.txt");
 
-  const args = [
-    "exec",
-    "-s", "workspace-write",
-    "--skip-git-repo-check",
-    "--json",
-    "-o", lastMsgFile,
-    ...(opts.extraArgs ?? []),
-    "--",
-    envelope.prompt,
-  ];
-
-  const res = await runWithTimeout(codexBin(), args, {
-    cwd: opts.cwd,
-    env: opts.env,
-    timeoutSec,
-  });
-
-  const stdout = res.stdout;
-  const stderr = res.stderr;
-
-  // Сигнал #2: turn.completed в JSONL-потоке.
-  const hasTurnCompleted = /"turn\.completed"/.test(stdout);
-
-  // Сигнал #3: sidecar-файл результата (--output-last-message). Читаем его.
-  let sidecarContent = "";
   try {
-    const { readFile } = await import("node:fs/promises");
-    sidecarContent = (await readFile(lastMsgFile, "utf8")).trim();
-  } catch {
-    // файла нет — сигнал провален
+    // review #64 (review-2026-07-13): длинный промпт (> 100 KB) через stdin,
+    // иначе E2BIG. codex exec читает промпт из stdin, если после -- нет аргумента.
+    const PROMPT_STDIN_THRESHOLD = 100 * 1024;
+    const useStdin = envelope.prompt.length > PROMPT_STDIN_THRESHOLD;
+    const args = [
+      "exec",
+      "-s", "workspace-write",
+      "--skip-git-repo-check",
+      "--json",
+      "-o", lastMsgFile,
+      ...(opts.extraArgs ?? []),
+      "--",
+      ...(useStdin ? [] : [envelope.prompt]),
+    ];
+
+    const res = await runWithTimeout(codexBin(), args, {
+      cwd: opts.cwd,
+      env: opts.env,
+      timeoutSec,
+      ...(useStdin ? { stdin: envelope.prompt } : {}),
+    });
+
+    const stdout = res.stdout;
+    const stderr = res.stderr;
+
+    // Сигнал #2: turn.completed в JSONL-потоке.
+    const hasTurnCompleted = /"turn\.completed"/.test(stdout);
+
+    // Сигнал #3: sidecar-файл результата (--output-last-message). Читаем его.
+    let sidecarContent = "";
+    try {
+      sidecarContent = (await readFile(lastMsgFile, "utf8")).trim();
+    } catch {
+      // файла нет — сигнал провален
+    }
+    const hasOutput = sidecarContent.length > 0;
+
+    const needsEdits = ["implement", "refine", "fix"].includes(envelope.role);
+    const hasChanges = needsEdits ? await gitHasChanges(opts.cwd) : null;
+
+    const signals: WorkerResult["signals"] = [
+      { name: "exit_0", ok: res.exit_code === 0, detail: `exit=${res.exit_code}` },
+      { name: "turn_completed", ok: hasTurnCompleted, detail: hasTurnCompleted ? "found" : "missing" },
+      { name: "sidecar_output", ok: hasOutput, detail: `${sidecarContent.length} chars` },
+    ];
+    if (needsEdits) {
+      signals.push({ name: "files_changed", ok: hasChanges === true, detail: hasChanges ? "yes" : "no" });
+    }
+
+    let reason: WorkerResult["reason"] = null;
+    if (res.timed_out) reason = "timeout";
+    else if (res.exit_code !== 0) reason = "nonzero_exit";
+    else if (!hasTurnCompleted) reason = "no_output";
+    else if (!hasOutput) reason = "no_output";
+
+    const success = signals.filter((s) => s.name !== "files_changed").every((s) => s.ok) &&
+      (!needsEdits || hasChanges === true);
+
+    return {
+      exit_ok: res.exit_code === 0,
+      exit_code: res.exit_code,
+      output: truncate(sidecarContent || stdout),
+      timed_out: res.timed_out,
+      has_output: hasOutput,
+      has_changes: hasChanges,
+      signals,
+      success,
+      reason,
+      stderr: truncate(stderr),
+      duration_ms: res.duration_ms,
+    };
+  } finally {
+    // review #59: удаляем temp-каталог на любом пути (success/error/timeout).
+    await rm(tmpDir, { recursive: true, force: true }).catch(() => {});
   }
-  const hasOutput = sidecarContent.length > 0;
-
-  const needsEdits = ["implement", "refine", "fix"].includes(envelope.role);
-  const hasChanges = needsEdits ? await gitHasChanges(opts.cwd) : null;
-
-  const signals: WorkerResult["signals"] = [
-    { name: "exit_0", ok: res.exit_code === 0, detail: `exit=${res.exit_code}` },
-    { name: "turn_completed", ok: hasTurnCompleted, detail: hasTurnCompleted ? "found" : "missing" },
-    { name: "sidecar_output", ok: hasOutput, detail: `${sidecarContent.length} chars` },
-  ];
-  if (needsEdits) {
-    signals.push({ name: "files_changed", ok: hasChanges === true, detail: hasChanges ? "yes" : "no" });
-  }
-
-  let reason: WorkerResult["reason"] = null;
-  if (res.timed_out) reason = "timeout";
-  else if (res.exit_code !== 0) reason = "nonzero_exit";
-  else if (!hasTurnCompleted) reason = "no_output";
-  else if (!hasOutput) reason = "no_output";
-
-  const success = signals.filter((s) => s.name !== "files_changed").every((s) => s.ok) &&
-    (!needsEdits || hasChanges === true);
-
-  return {
-    exit_ok: res.exit_code === 0,
-    exit_code: res.exit_code,
-    output: truncate(sidecarContent || stdout),
-    timed_out: res.timed_out,
-    has_output: hasOutput,
-    has_changes: hasChanges,
-    signals,
-    success,
-    reason,
-    stderr: truncate(stderr),
-    duration_ms: res.duration_ms,
-  };
 };
 
 export default runCodex;

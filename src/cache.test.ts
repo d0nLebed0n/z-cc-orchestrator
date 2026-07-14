@@ -228,4 +228,43 @@ describe("cache", () => {
       rmSync(repo, { recursive: true, force: true });
     }
   });
+
+  // review #48 (review-2026-07-13): git status --porcelain сворачивает новый
+  // каталог в `?? newdir/` → readFile давал EISDIR, и разные файлы внутри
+  // каталога давали одинаковый marker. Теперь используется ls-files -z,
+  // разворачивающий каталог в отдельные файлы.
+  it("captureRepoFingerprint differs for files inside an untracked directory", async () => {
+    const { captureRepoFingerprint } = await import("./cache.ts?t=" + Date.now());
+    const repo = freshRepo();
+    try {
+      mkdirSync(join(repo, "newdir"), { recursive: true });
+      writeFileSync(join(repo, "newdir", "a.txt"), "CONTENT_A\n");
+      const fp1 = await captureRepoFingerprint(repo);
+      writeFileSync(join(repo, "newdir", "a.txt"), "CONTENT_B\n");
+      const fp2 = await captureRepoFingerprint(repo);
+      expect(fp1).not.toBeNull();
+      expect(fp2).not.toBeNull();
+      expect(fp1!.dirtyFingerprint).not.toBe(fp2!.dirtyFingerprint);
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  // review #48: имена с пробелами квотировались porcelain как `?? "a b.txt"`,
+  // slice(3) оставлял кавычки → ENOENT → одинаковый marker для разных версий.
+  it("captureRepoFingerprint differs for untracked file with spaces in name", async () => {
+    const { captureRepoFingerprint } = await import("./cache.ts?t=" + Date.now());
+    const repo = freshRepo();
+    try {
+      writeFileSync(join(repo, "a b.txt"), "VERSION_1\n");
+      const fp1 = await captureRepoFingerprint(repo);
+      writeFileSync(join(repo, "a b.txt"), "VERSION_2\n");
+      const fp2 = await captureRepoFingerprint(repo);
+      expect(fp1).not.toBeNull();
+      expect(fp2).not.toBeNull();
+      expect(fp1!.dirtyFingerprint).not.toBe(fp2!.dirtyFingerprint);
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
 });

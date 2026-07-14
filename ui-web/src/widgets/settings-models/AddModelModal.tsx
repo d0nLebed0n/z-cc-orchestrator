@@ -122,6 +122,8 @@ export function AddModelModal({ onClose, onSaved, editing }: Props) {
         zIndex: 100,
       }}
       onClick={onClose}
+      // review #60: Escape закрывает модал (базовая keyboard accessibility).
+      onKeyDown={(e) => { if (e.key === "Escape") onClose(); }}
     >
       <div
         style={{
@@ -148,7 +150,10 @@ export function AddModelModal({ onClose, onSaved, editing }: Props) {
                   key={k}
                   type="button"
                   aria-pressed={kind === k}
-                  style={{ ...kind === k ? cardActiveStyle : cardStyle, border: "1px solid transparent", cursor: "pointer" }}
+                  // review #60 (review-2026-07-13): fallback border РАНЬШЕ active
+                  // spread — иначе "1px solid transparent" безусловно затирал
+                  // синюю рамку выбранного типа (cardActiveStyle.border).
+                  style={{ border: "1px solid transparent", ...(kind === k ? cardActiveStyle : cardStyle), cursor: "pointer" }}
                   onClick={() => { setKind(k); setDetectResult(null); }}
                 >
                   <div style={{ fontWeight: 600, fontSize: 14 }}>{KIND_LABELS[k]}</div>
@@ -201,15 +206,19 @@ export function AddModelModal({ onClose, onSaved, editing }: Props) {
 
         {isApi && (
           <>
-            <label style={labelStyle}>Provider (формат)</label>
-            <select style={{ ...inputStyle, marginBottom: 12 }} value={provider} onChange={(e) => setProvider(e.target.value as "anthropic" | "openai")}>
+            <label style={labelStyle}>Provider (формат){editing ? " — нельзя изменить, создайте новую модель" : ""}</label>
+            {/* review #54 (review-2026-07-13): provider immutable в edit. Раньше
+                select был активен, но update-body его не отправлял — выбор молча
+                игнорировался. Теперь явно disabled с подсказкой. */}
+            <select style={{ ...inputStyle, marginBottom: 12, opacity: editing ? 0.6 : 1 }} value={provider} onChange={(e) => setProvider(e.target.value as "anthropic" | "openai")} disabled={!!editing}>
               <option value="anthropic">Anthropic (Messages API)</option>
               <option value="openai">OpenAI (Chat Completions)</option>
             </select>
             <label style={labelStyle}>Base URL</label>
             <input style={{ ...inputStyle, marginBottom: 12 }} value={baseUrl} onChange={(e) => setBaseUrl(e.target.value)} placeholder="https://api.example.com" />
-            <label style={labelStyle}>Имя модели (optional для provider=openai)</label>
-            <input style={{ ...inputStyle, marginBottom: 12 }} value={modelName} onChange={(e) => setModelName(e.target.value)} placeholder="напр. gpt-4o (если эндпоинт требует явно)" />
+            {/* review #49: model обязательно для provider=openai (dispatch требует). */}
+            <label style={labelStyle}>Имя модели {provider === "openai" ? "(обязательно для OpenAI)" : "(optional)"}</label>
+            <input style={{ ...inputStyle, marginBottom: 12 }} value={modelName} onChange={(e) => setModelName(e.target.value)} placeholder={provider === "openai" ? "напр. gpt-4o" : "опционально для Anthropic-совместимого"} />
             <label style={labelStyle}>API Key</label>
             <input type="password" style={{ ...inputStyle, marginBottom: 12 }} value={apiKey} onChange={(e) => setApiKey(e.target.value)} placeholder={editing ? "(оставить пустым = не менять)" : "sk-..."} />
           </>

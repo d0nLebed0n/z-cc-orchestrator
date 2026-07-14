@@ -121,6 +121,10 @@ export function makeRunApiOpenAi(
             continue;
           }
           lastReadPath = rp;
+        } else {
+          // review #50: non-read tool может поменять файл — сброс, иначе
+          // read→write→read сочтёт последнее чтение дубликатом (устаревшее).
+          lastReadPath = null;
         }
         try {
           const result = await executeTool(call, opts.cwd);

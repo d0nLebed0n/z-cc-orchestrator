@@ -50,10 +50,13 @@ export function pickReviewer(authorFamily: Family, prefer?: string): string {
     const m = getModels().find((x) => x.family === fam);
     if (m) return m.id;
   }
-  // Фолбэк: первая доступная не-local модель.
-  const fallback = getModels().find((m) => m.family !== "local");
-  if (!fallback) throw new CrossFamilyViolation("No reviewer model available in registry");
-  return fallback.id;
+  // review #62 (review-2026-07-13): нет модели чужой семьи. Раньше фолбэк брал
+  // любую не-local модель — включая семью автора, молча нарушая кросс-семейный
+  // инвариант PLAN §3.4. Теперь бросаем ошибку: тихой подмены быть не должно.
+  throw new CrossFamilyViolation(
+    `No reviewer model available in a family other than '${authorFamily}'. ` +
+      `Add a model from a different family in Settings or set allow_same_family on the step.`,
+  );
 }
 
 export class CrossFamilyViolation extends Error {

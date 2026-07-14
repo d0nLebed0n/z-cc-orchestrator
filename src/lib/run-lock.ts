@@ -29,7 +29,9 @@ const LOCK_FILE = join(BLACKBOARD_DIR, ".run-lock");
 export interface RunLock {
   /** Уникальный токен владельца для этого захвата. */
   readonly ownerToken: string;
-  release(): void;
+  // review #47: release стал Promise — awaited в finally runWorkflow, иначе
+  // следующий acquire в том же процессе мог начаться до удаления файла.
+  release(): Promise<void>;
 }
 
 function isProcessAlive(pid: number): boolean {
@@ -62,18 +64,31 @@ async function readLock(path: string): Promise<{ pid: number; token: string } | 
 /**
  * Атомарно создать lock-файл с нашим owner-token. Возвращает true при успехе,
  * false если файл уже существует (EEXIST).
+ *
+ * review #47 (review-2026-07-13): fd закрывается в finally, а при ошибке
+ * writeFile (после успешного open wx) созданный файл удаляется — иначе он
+ * остаётся как мусор и следующий acquire падает в stale-recovery.
  */
 async function tryCreateLock(path: string, ownerToken: string): Promise<boolean> {
   const pid = process.pid;
+  let fh: Awaited<ReturnType<typeof open>> | null = null;
+  let created = false;
   try {
-    const fh = await open(path, "wx", 0o644);
+    fh = await open(path, "wx", 0o644);
+    created = true; // файл создан этим вызовом
     await fh.writeFile(`${pid}:${ownerToken}`);
-    await fh.close();
     return true;
   } catch (e) {
     const code = (e as NodeJS.ErrnoException).code;
     if (code === "EEXIST") return false;
+    // Ошибка записи в уже созданный файл — удаляем мусор, чтобы не ломать
+    // следующий acquire (иначе он увидит пустой/битый lock и пойдёт в recovery).
+    if (created) {
+      await unlink(path).catch(() => {});
+    }
     throw e;
+  } finally {
+    await fh?.close().catch(() => {});
   }
 }
 
@@ -140,21 +155,20 @@ function makeLock(lockPath: string, ownerToken: string): RunLock {
     /**
      * Освободить lock: удалить файл ТОЛЬКО если мы всё ещё владеем им.
      * review #25: иначе release после stale-recovery мог удалить чужой lock.
+     * review #47: возвращаем Promise — вызывающий (runWorkflow finally)
+     * обязан его дождаться, иначе следующий acquire в том же процессе
+     * увидит ещё не удалённый файл.
      */
-    release(): void {
-      (async () => {
-        const cur = await readLock(lockPath);
-        // Удаляем только если владелец — мы. Нет файла / другой владелец — не трогаем.
-        if (cur && cur.token === ownerToken) {
-          try {
-            await unlink(lockPath);
-          } catch {
-            // ignore — файл уже удалён
-          }
+    async release(): Promise<void> {
+      const cur = await readLock(lockPath);
+      // Удаляем только если владелец — мы. Нет файла / другой владелец — не трогаем.
+      if (cur && cur.token === ownerToken) {
+        try {
+          await unlink(lockPath);
+        } catch {
+          // ignore — файл уже удалён
         }
-      })().catch(() => {
-        // best-effort: ошибка чтения/удаления не должна валить release.
-      });
+      }
     },
   };
 }

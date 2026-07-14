@@ -31,7 +31,8 @@ export interface ArchitectResult {
  * значения = позиция перед следующим ключом из ARCHITECT_KEYS (или `}` перед
  * концом строки). Затем unescape: `\n` → newline, `\"` → `"`, `\\` → `\`.
  */
-function extractKeysLenient(jsonStr: string): Record<string, string> | null {
+// review #63: экспортирована для direct unit-теста unescape-логики.
+export function extractKeysLenient(jsonStr: string): Record<string, string> | null {
   const result: Record<string, string> = {};
   // Позиции начал всех ключей.
   const positions: { key: string; start: number }[] = [];
@@ -72,12 +73,23 @@ function extractKeysLenient(jsonStr: string): Record<string, string> | null {
     let raw = jsonStr.slice(start, end);
     // Убираем trailing запятую/пробелы если остались.
     raw = raw.replace(/[,}\s]+$/, "");
-    // Unescape: \n → newline, \" → ", \\ → \, \t → tab.
-    const unescaped = raw
-      .replace(/\\n/g, "\n")
-      .replace(/\\t/g, "\t")
-      .replace(/\\"/g, '"')
-      .replace(/\\\\/g, "\\");
+    // review #63 (review-2026-07-13): unescape одним проходом через replacer.
+    // Раньше четыре последовательных .replace декодировали \n/\t/\" ДО коллапса
+    // \\ — из-за этого `C:\\newdir` (один обратный слэш + newdir) превращалось
+    // в `C:\` + настоящий newline + `ewdir`. Единая функция обрабатывает
+    // escape-пары согласованно: видит \\ как пару и оставляет одиночный \,
+    // не давая последующему n приклеиться как \n.
+    const unescaped = raw.replace(/\\(.)/g, (_m, ch: string) => {
+      switch (ch) {
+        case "n": return "\n";
+        case "t": return "\t";
+        case '"': return '"';
+        case "\\": return "\\";
+        case "/": return "/";
+        case "r": return "\r";
+        default: return ch; // неизвестная пара — отбрасываем backslash
+      }
+    });
     result[key] = unescaped;
   }
   return result;

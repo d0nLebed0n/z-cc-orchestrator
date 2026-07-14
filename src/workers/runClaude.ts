@@ -36,18 +36,24 @@ export const runClaude: WorkerFn = async (envelope, opts) => {
   // review #3: на ретраях раннер передаёт остаток бюджета, чтобы шаг не
   // превышал wall_time_sec суммарно за все попытки.
   const timeoutSec = opts.wallTimeSecOverride ?? envelope.budget.wall_time_sec;
+  // review #64 (review-2026-07-13): длинный промпт (> 100 KB) пайпим через stdin,
+  // а не argv — иначе запуск падает с E2BIG (ARG_MAX). claude -p без аргумента
+  // читает промпт из stdin.
+  const PROMPT_STDIN_THRESHOLD = 100 * 1024;
+  const useStdin = envelope.prompt.length > PROMPT_STDIN_THRESHOLD;
   const args = [
     "-p", // print/headless режим
     "--output-format",
     "text",
     ...(opts.extraArgs ?? []),
-    envelope.prompt,
+    ...(useStdin ? [] : [envelope.prompt]),
   ];
 
   const res = await runWithTimeout(claudeBin(), args, {
     cwd: opts.cwd,
     env: opts.env,
     timeoutSec,
+    ...(useStdin ? { stdin: envelope.prompt } : {}),
   });
 
   // plan-шаг (особенно fan-out) выдаёт JSON SubtaskPlan — для большой задачи

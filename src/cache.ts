@@ -88,18 +88,26 @@ export async function captureRepoFingerprint(cwd: string): Promise<{
     // любого изменения рабочей копии.
     const { stdout: porcelain } = await execFileAsync("git", ["-C", cwd, "status", "--porcelain"]);
     const { stdout: diff } = await execFileAsync("git", ["-C", cwd, "diff", "HEAD"]).catch(() => ({ stdout: "" }));
-    // untracked-файлы: имена из porcelain (?? prefix).
-    const untracked = porcelain
-      .split("\n")
-      .filter((l) => l.startsWith("?? "))
-      .map((l) => l.slice(3).trim());
 
-    // review #29 (review-2026-07-13): хешируем ПОЛНОЕ содержимое untracked
-    // без slice(0,4096) и без лимита slice(0,50). Раньше две версии файла,
-    // различающиеся только после 4096-го байта, давали одинаковый ключ → stale.
-    // Инкрементальный hash — не копим всё в памяти. Ошибки чтения НЕ глотаем
-    // молча: пишем в маркер путь + код ошибки, иначе два разных сбоя (ENOENT,
-    // EACCES) и пустой файл давали бы одинаковое состояние.
+    // review #48 (review-2026-07-13): список untracked через NUL-separated
+    // `git ls-files --others --exclude-standard -z`. Раньше брали из porcelain,
+    // который (1) сворачивает новый каталог в `?? newdir/` — readFile давал
+    // EISDIR, и любые изменения файлов внутри каталога имели один marker;
+    // (2) квотит имена с пробелами как `?? "a b.txt"` — slice(3) оставлял кавычки,
+    // readFile падал ENOENT, разные версии давали одинаковый marker.
+    // ls-files -z разворачивает каталоги в отдельные файлы и не квотит.
+    const { stdout: untrackedRaw } = await execFileAsync(
+      "git",
+      ["-C", cwd, "ls-files", "--others", "--exclude-standard", "-z"],
+      { maxBuffer: 50 * 1024 * 1024 },
+    ).catch(() => ({ stdout: "" }));
+    // NUL-separated; последний элемент после финального NUL — пустой (отбрасываем).
+    const untracked = untrackedRaw.split("\0").filter((f) => f.length > 0);
+
+    // review #29: хешируем ПОЛНОЕ содержимое untracked без обрезки. Инкрементальный
+    // hash — не копим всё в памяти. Ошибки чтения НЕ глотаем молча: пишем маркер
+    // путь + код ошибки, иначе два разных сбоя (ENOENT, EACCES) и пустой файл
+    // давали бы одинаковое состояние.
     const { readFile } = await import("node:fs/promises");
     const hash = createHash("sha256");
     hash.update(`base=${sha.trim()}\np=${porcelain}\ndiff=${diff}\nuntracked=`);

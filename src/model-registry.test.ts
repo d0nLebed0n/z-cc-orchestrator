@@ -23,15 +23,61 @@ describe("model-registry", () => {
   });
 
   it("reads existing models.yaml", async () => {
-    // review #38: api-модель обязана иметь provider+base_url (discriminated union).
+    // review #38: api-модель обязана иметь provider+base_url.
+    // review #51: все 7 ролей обязательны (включая architect).
     writeFileSync(
       join(dir, "models.yaml"),
-      `models:\n  - id: custom\n    label: Custom\n    kind: api\n    family: zai\n    provider: anthropic\n    base_url: https://api.example.com\nroles:\n  plan: custom\n  implement: custom\n  review: custom\n  refine: custom\n  fix: custom\n  final: custom\ncomplexity_threshold: 40\n`,
+      `models:\n  - id: custom\n    label: Custom\n    kind: api\n    family: zai\n    provider: anthropic\n    base_url: https://api.example.com\nroles:\n  plan: custom\n  implement: custom\n  review: custom\n  refine: custom\n  fix: custom\n  final: custom\n  architect: custom\ncomplexity_threshold: 40\n`,
     );
     const { loadModelsConfig } = await import("./model-registry.ts?t=" + Date.now());
     const cfg = loadModelsConfig(dir);
     expect(cfg.models[0]!.id).toBe("custom");
     expect(cfg.complexity_threshold).toBe(40);
+  });
+
+  // review #51 (review-2026-07-13): целостность каталога.
+  it("ModelsConfigSchema rejects duplicate model ids", async () => {
+    const { ModelsConfigSchema } = await import("./model-config-dto.ts?t=" + Date.now());
+    const cfg = {
+      models: [
+        { id: "x", label: "X1", kind: "claude-binary", family: "anthropic" },
+        { id: "x", label: "X2", kind: "codex-binary", family: "openai" },
+      ],
+      roles: { plan: "x", implement: "x", review: "x", refine: "x", fix: "x", final: "x", architect: "x" },
+      complexity_threshold: 65,
+    };
+    expect(() => ModelsConfigSchema.parse(cfg)).toThrow(/duplicate model id/);
+  });
+
+  it("ModelsConfigSchema rejects missing roles", async () => {
+    const { ModelsConfigSchema } = await import("./model-config-dto.ts?t=" + Date.now());
+    const cfg = {
+      models: [{ id: "x", label: "X", kind: "claude-binary", family: "anthropic" }],
+      roles: { plan: "x", implement: "x", review: "x" }, // неполный набор
+      complexity_threshold: 65,
+    };
+    expect(() => ModelsConfigSchema.parse(cfg)).toThrow(/missing required role/);
+  });
+
+  it("ModelsConfigSchema rejects dangling role reference", async () => {
+    const { ModelsConfigSchema } = await import("./model-config-dto.ts?t=" + Date.now());
+    const cfg = {
+      models: [{ id: "x", label: "X", kind: "claude-binary", family: "anthropic" }],
+      roles: { plan: "x", implement: "x", review: "x", refine: "x", fix: "x", final: "x", architect: "missing" },
+      complexity_threshold: 65,
+    };
+    expect(() => ModelsConfigSchema.parse(cfg)).toThrow(/references unknown model/);
+  });
+
+  // review #49: provider=openai ⇒ model обязательно (на уровне каталога).
+  it("ModelsConfigSchema rejects api+openai without model", async () => {
+    const { ModelsConfigSchema } = await import("./model-config-dto.ts?t=" + Date.now());
+    const cfg = {
+      models: [{ id: "oai", label: "OAI", kind: "api", family: "openai", provider: "openai", base_url: "https://api.example.com" }],
+      roles: { plan: "oai", implement: "oai", review: "oai", refine: "oai", fix: "oai", final: "oai", architect: "oai" },
+      complexity_threshold: 65,
+    };
+    expect(() => ModelsConfigSchema.parse(cfg)).toThrow(/required for provider=openai/);
   });
 
   // review #38 (review-2026-07-13): discriminated union в ModelInfoSchema.
