@@ -90,6 +90,9 @@ const DEFAULT_CONFIG: ModelsConfig = {
     refine: "glm",
     fix: "glm",
     final: "claude",
+    // review #56 (review-2026-07-13): согласовано с core DEFAULT_CONFIG —
+    // иначе backend-seeded registry расходился с core до последующей миграции.
+    architect: "claude",
   },
   complexity_threshold: 65,
 };
@@ -206,6 +209,10 @@ export class ModelsService {
     // при запуске. Теперь явный missing_credentials/invalid_config.
     if (model.kind === "api") {
       if (!model.base_url) return "invalid_config";
+      // review #49: для provider=openai model обязательна (dispatchWorker бросает
+      // без него). Раньше status возвращал ready для заведомо неработоспособной
+      // конфигурации. Для anthropic model опциональна.
+      if (model.provider === "openai" && !model.model) return "invalid_config";
       const secrets = await this.readSecrets();
       if (!secrets.has(model.id)) return "missing_credentials";
       return "ready";
@@ -244,15 +251,24 @@ export class ModelsService {
     // review #28 (review-2026-07-13): snapshot ДО мутации. Раньше prevCfg
     // снимался после push — rollback восстанавливал конфиг С новой моделью.
     const prevCfg = stringifyYaml(cfg);
+    // review #58: snapshot ранее существовавшего секрета для этого id (orphan
+    // от прошлой неудачи). Раньше catch звал deleteSecret(id), что удаляло бы
+    // чужой orphan-key. Восстанавливаем snapshot, а не blindly удаляем.
+    let prevSecret: string | null = null;
+    if (input.kind === "api" && input.api_key) {
+      const secrets = await this.readSecrets();
+      prevSecret = secrets.has(input.id) ? secrets.get(input.id)! : null;
+    }
     cfg.models.push(stored);
     try {
       await this.writeConfig(cfg);
       if (input.kind === "api" && input.api_key) await this.writeSecret(input.id, input.api_key);
     } catch (e) {
-      // Откатить config до состояния до create. Secret мог не успеть записаться
-      // (writeConfig упал первым) — удаляем на случай, если writeSecret частично прошёл.
+      // Откатить config до состояния до create. Secret восстанавливаем в
+      // предыдущее состояние (orphan или отсутствие), а не blindly удаляем.
       await atomicWriteFile(PATHS.modelsConfig, prevCfg).catch(() => {});
-      await this.deleteSecret(input.id).catch(() => {});
+      if (prevSecret !== null) await this.writeSecret(input.id, prevSecret).catch(() => {});
+      else await this.deleteSecret(input.id).catch(() => {});
       throw e;
     }
     return { ...stored, status: await this.statusOf(stored) };

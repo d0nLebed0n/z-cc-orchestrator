@@ -1007,7 +1007,9 @@ export async function runWorkflow(opts: RunOptions): Promise<RunResult> {
   try {
     return await runWorkflowBody(opts, loaded, blackboardRoot);
   } finally {
-    runLock.release();
+    // review #47: дожидаемся удаления lock-файла, иначе следующий acquire
+    // в том же процессе увидит ещё живой файл и решит, что run активен.
+    await runLock.release();
   }
 }
 

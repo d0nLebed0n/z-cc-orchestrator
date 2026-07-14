@@ -142,6 +142,12 @@ export const runOllama: WorkerFn = async (envelope, opts) => {
           continue;
         }
         lastReadPath = rp;
+      } else {
+        // review #50 (review-2026-07-13): любой non-read tool (write_file, edit,
+        // bash) может поменять файл. Сбрасываем lastReadPath, иначе read_file(a)
+        // → write_file(a) → read_file(a) сочтёт последнее чтение дубликатом и
+        // отдаст устаревшее содержимое, скрыв от модели её собственную правку.
+        lastReadPath = null;
       }
       try {
         const result = await executeTool(call, opts.cwd);

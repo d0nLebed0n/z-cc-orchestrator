@@ -22,12 +22,13 @@ export interface SpawnResult {
  * Запустить команду headless с таймбоксом.
  * @param cmd  исполняемый файл (или полный путь)
  * @param args аргументы
- * @param opts cwd, env, timeoutSec
+ * @param opts cwd, env, timeoutSec, stdin (опц. — review #64: длинный промпт
+ *             пайпится через stdin вместо argv, чтобы не упереться в ARG_MAX/E2BIG)
  */
 export function runWithTimeout(
   cmd: string,
   args: string[],
-  opts: { cwd: string; env?: Record<string, string>; timeoutSec: number },
+  opts: { cwd: string; env?: Record<string, string>; timeoutSec: number; stdin?: string },
 ): Promise<SpawnResult> {
   return new Promise((resolve) => {
     const start = Date.now();
@@ -37,7 +38,8 @@ export function runWithTimeout(
     const child = spawn(cmd, args, {
       cwd: opts.cwd,
       env,
-      stdio: ["ignore", "pipe", "pipe"],
+      // review #64: pipe stdin когда задан opts.stdin, иначе ignore.
+      stdio: [opts.stdin !== undefined ? "pipe" : "ignore", "pipe", "pipe"],
       // detached: новая process group (setsid) — child.pid = лидер группы.
       // Позволяет убить ВСЮ группу при таймауте, включая внуков (claude/codex
       // спавнят дочерние процессы, которые иначе переживут SIGKILL head-процесса).
@@ -54,6 +56,13 @@ export function runWithTimeout(
         // ESRCH — группа уже завершилась; не ошибка.
       }
     };
+
+    // review #64 (review-2026-07-13): длинный промпт через stdin вместо argv.
+    // Записываем и закрываем stdin; ошибка (EPIPE если процесс уже вышел) не валит запуск.
+    if (opts.stdin !== undefined && child.stdin) {
+      child.stdin.on("error", () => {});
+      child.stdin.end(opts.stdin);
+    }
 
     let stdout = "";
     let stderr = "";

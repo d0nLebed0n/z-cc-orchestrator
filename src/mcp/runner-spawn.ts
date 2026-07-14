@@ -183,11 +183,29 @@ export async function runOnce(
       stdio: ["ignore", "pipe", "pipe"],
       env: process.env,
     });
+    // review #55 (review-2026-07-13): ring buffer (2 MB) + StringDecoder —
+    // раньше output копился без лимита и резался по границе UTF-8 chunk'а.
+    // Контракт идентичен backend ProcessManager.runOnce (review #22).
+    const MAX = 2 * 1024 * 1024;
+    const stdoutDec = new StringDecoder("utf8");
+    const stderrDec = new StringDecoder("utf8");
     let output = "";
-    child.stdout?.on("data", (c: Buffer) => (output += c.toString("utf8")));
-    child.stderr?.on("data", (c: Buffer) => (output += c.toString("utf8")));
-    child.on("exit", (code) => resolveP({ ok: code === 0, code, output }));
-    child.on("error", () => resolveP({ ok: false, code: null, output }));
+    const append = (text: string): void => {
+      output += text;
+      if (output.length > MAX) output = output.slice(-MAX);
+    };
+    child.stdout?.on("data", (c: Buffer) => append(stdoutDec.write(c)));
+    child.stderr?.on("data", (c: Buffer) => append(stderrDec.write(c)));
+    child.on("exit", (code) => {
+      append(stdoutDec.end());
+      append(stderrDec.end());
+      resolveP({ ok: code === 0, code, output });
+    });
+    child.on("error", () => {
+      append(stdoutDec.end());
+      append(stderrDec.end());
+      resolveP({ ok: false, code: null, output });
+    });
   });
 }
 
